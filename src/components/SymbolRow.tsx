@@ -116,8 +116,14 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
           <SlopeIcon value={legacyMetrics.cvdSlope} />
           <MetricValue value={legacyMetrics.cvdSlope} />
         </div>
-        <div className="col-span-1">
-          <span className="text-xs text-zinc-600">-</span>
+        <div className="col-span-1 flex items-center justify-center">
+          {legacyMetrics.tradeSignal === 1 ? (
+            <span className="text-green-400 font-bold text-xs bg-green-900/40 px-2 py-0.5 rounded border border-green-800">LONG</span>
+          ) : legacyMetrics.tradeSignal === -1 ? (
+            <span className="text-red-400 font-bold text-xs bg-red-900/40 px-2 py-0.5 rounded border border-red-800">SHORT</span>
+          ) : (
+            <span className="text-zinc-600 text-xs">-</span>
+          )}
         </div>
         <div className="col-span-1 text-right">
           <Badge state={state} />

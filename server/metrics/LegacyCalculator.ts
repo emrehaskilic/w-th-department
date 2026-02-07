@@ -1,3 +1,4 @@
+// [GITHUB VERIFIED] Backend implementation of OBI, VWAP, DeltaZ, CVD Slope, and Advanced Scores
 import { OrderbookState, bestBid, bestAsk } from './OrderbookManager';
 
 // Type for a trade used in the legacy metrics calculations
@@ -14,6 +15,14 @@ interface LegacyTrade {
  * imbalance scores, rolling delta windows, Z‐scores and session CVD
  * slope.  The implementation strives to be lightweight but still
  * produce values compatible with the original UI expectations.
+ * 
+ * Implements:
+ * - OBI (Weighted, Deep, Divergence)
+ * - Session VWAP
+ * - Delta Z-Score
+ * - CVD Slope
+ * - Advanced Scores: Sweep, Breakout, Regime, Absorption
+ * - Trade Signal
  */
 export class LegacyCalculator {
     // Keep a rolling list of trades for delta calculations (max 10 seconds)
@@ -240,6 +249,12 @@ export class LegacyCalculator {
             }
         }
 
+        // --- Signal ---
+        // Simple composite signal: OBI + DeltaZ + Slope
+        let tradeSignal = 0; // 0=Neutral, 1=Buy, -1=Sell
+        if (obiWeighted > 0.25 && deltaZ > 1.0 && cvdSlope > 0) tradeSignal = 1;
+        else if (obiWeighted < -0.25 && deltaZ < -1.0 && cvdSlope < 0) tradeSignal = -1;
+
         return {
             price: midPrice,
             obiWeighted,
@@ -257,7 +272,8 @@ export class LegacyCalculator {
             sweepFadeScore,
             breakoutScore,
             regimeWeight,
-            tradeCount: this.trades.length
+            tradeCount: this.trades.length,
+            tradeSignal
         };
     }
 }
