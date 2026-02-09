@@ -328,12 +328,7 @@ export class Orchestrator {
       const start = this.capitalSettings.startingMarginUsdt;
 
       // If wallet exceeds max budget allowed by rampMaxMult, increase maxMult automatically
-      if (start > 0) {
-        const requiredMult = Math.ceil(wallet / start);
-        if (requiredMult > this.capitalSettings.rampMaxMult) {
-          this.capitalSettings.rampMaxMult = requiredMult;
-        }
-      }
+
 
       this.sizingRamp.updateConfig({
         startingMarginUsdt: this.capitalSettings.startingMarginUsdt,
@@ -343,7 +338,7 @@ export class Orchestrator {
         minMarginUsdt: this.config.minMarginUsdt,
       });
 
-      this.sizingRamp.forceBudget(wallet);
+
     } else {
       this.sizingRamp.updateConfig({
         startingMarginUsdt: this.capitalSettings.startingMarginUsdt,

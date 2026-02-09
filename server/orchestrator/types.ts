@@ -104,6 +104,7 @@ export interface SymbolState {
   position: PositionState | null;
   openOrders: Map<string, OpenOrderState>;
   hasOpenEntryOrder: boolean;
+  pendingEntry: boolean;
   cooldown_until_ms: number;
   last_exit_event_time_ms: number;
   marginRatio: number | null;

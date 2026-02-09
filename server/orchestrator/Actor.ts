@@ -69,6 +69,7 @@ export class SymbolActor {
       position: null,
       openOrders: new Map<string, OpenOrderState>(),
       hasOpenEntryOrder: false,
+      pendingEntry: false,
       cooldown_until_ms: 0,
       last_exit_event_time_ms: 0,
       marginRatio: null,
@@ -119,6 +120,11 @@ export class SymbolActor {
     this.lastPrintsPerSecond = envelope.metrics.prints_per_second || 0;
     this.updateExecQualityFromMetrics(envelope.metrics.spread_pct);
 
+    // State Machine Guard: If pending entry, DO NOT EVALUATE
+    if (this.state.pendingEntry || this.state.hasOpenEntryOrder) {
+      return;
+    }
+
     const actions = this.deps.decisionEngine.evaluate({
       symbol: envelope.symbol,
       event_time_ms: envelope.canonical_time_ms,
@@ -148,21 +154,21 @@ export class SymbolActor {
     const invariantReason = forbiddenEmergency
       ? 'forbidden_emergency_exit_reason'
       : this.state.execQuality.quality === 'UNKNOWN' && actions.some((a) => a.reason === 'emergency_exit_exec_quality')
-      ? 'panic_exit_with_missing_exec_metrics'
-      : null;
+        ? 'panic_exit_with_missing_exec_metrics'
+        : null;
     const executionMode: 'NORMAL' | 'DEGRADED' | 'FREEZE' =
       this.state.execQuality.freezeActive
         ? 'FREEZE'
         : envelope.gate.mode === GateMode.V1_NO_LATENCY
-        ? 'DEGRADED'
-        : 'NORMAL';
+          ? 'DEGRADED'
+          : 'NORMAL';
     const exitReason = actions.some((a) => a.reason === 'profit_lock_exit')
       ? 'profit_lock'
       : actions.some((a) => a.reason === 'emergency_exit_hard_stop')
-      ? 'hard_stop'
-      : actions.some((a) => a.reason === 'emergency_exit_liquidation_risk')
-      ? 'liquidation'
-      : null;
+        ? 'hard_stop'
+        : actions.some((a) => a.reason === 'emergency_exit_liquidation_risk')
+          ? 'liquidation'
+          : null;
 
     this.deps.onDecisionLogged({
       symbol: envelope.symbol,
@@ -191,6 +197,10 @@ export class SymbolActor {
     });
 
     if (actions.length > 0 && !(actions.length === 1 && actions[0].type === 'NOOP')) {
+      // Optimistic State Update
+      if (actions.some(a => a.type === 'ENTRY_PROBE' || a.type === 'ADD_POSITION')) {
+        this.state.pendingEntry = true;
+      }
       await this.deps.onActions(actions);
     }
   }
@@ -212,6 +222,8 @@ export class SymbolActor {
       const terminal = event.status === 'FILLED' || event.status === 'CANCELED' || event.status === 'REJECTED' || event.status === 'EXPIRED';
       if (terminal) {
         this.state.openOrders.delete(event.orderId);
+        // Clear pending flag on terminal state
+        this.state.pendingEntry = false;
       } else {
         this.state.openOrders.set(event.orderId, {
           orderId: event.orderId,
@@ -240,6 +252,8 @@ export class SymbolActor {
         });
       }
       this.state.hasOpenEntryOrder = Array.from(this.state.openOrders.values()).some((o) => !o.reduceOnly);
+      // Reset pending state on snapshot, trust the snapshot
+      this.state.pendingEntry = this.state.hasOpenEntryOrder;
       this.deps.onExecutionLogged(event, this.snapshotState());
       return;
     }
@@ -274,6 +288,13 @@ export class SymbolActor {
 
     if (event.type === 'ACCOUNT_UPDATE') {
       const hadPosition = this.state.position !== null;
+
+      // FAIL-SAFE: If equity drops significantly (> 50 USDT) while FLAT, assume State Blindness and HALT.
+      if (!hadPosition && this.state.walletBalance > 0 && event.walletBalance < this.state.walletBalance - 50) {
+        console.error(`[ACTOR ${this.deps.symbol}] CRITICAL FAIL-SAFE: Equity drop detected without position! ${this.state.walletBalance} -> ${event.walletBalance}. HALTING.`);
+        this.state.halted = true;
+      }
+
       this.state.availableBalance = event.availableBalance;
       this.state.walletBalance = event.walletBalance;
       this.state.marginRatio = event.walletBalance > 0
