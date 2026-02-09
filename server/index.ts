@@ -79,6 +79,8 @@ const DEPTH_LEVELS = Number(process.env.DEPTH_LEVELS || 20);
 const DEPTH_STREAM_MODE = String(process.env.DEPTH_STREAM_MODE || 'diff').toLowerCase(); // diff | partial
 const WS_UPDATE_SPEED = String(process.env.WS_UPDATE_SPEED || '250ms'); // 100ms | 250ms
 const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
+const MIN_RESYNC_INTERVAL_MS = 15000;
+const GRACE_PERIOD_MS = 5000;
 
 // =============================================================================
 // Logging
@@ -102,6 +104,7 @@ interface SymbolMeta {
     backoffMs: number;
     consecutiveErrors: number;
     isResyncing: boolean;
+    lastResyncTs: number; // New throttle
     // Counters
     depthMsgCount: number;
     depthMsgCount10s: number;
@@ -178,9 +181,10 @@ function getMeta(symbol: string): SymbolMeta {
             backoffMs: MIN_BACKOFF_MS,
             consecutiveErrors: 0,
             isResyncing: false,
+            lastResyncTs: 0,
             depthMsgCount: 0,
             depthMsgCount10s: 0,
-            lastDepthMsgTs: 0,
+            lastDepthMsgTs: Date.now(), // Avoid immediate stale check
             tradeMsgCount: 0,
             desyncCount: 0,
             snapshotCount: 0,
@@ -571,27 +575,44 @@ function evaluateLiveReadiness(symbol: string) {
     const snapshotFresh = meta.lastSnapshotOk > 0 && (now - meta.lastSnapshotOk) <= LIVE_SNAPSHOT_FRESH_MS;
     const hasBook = ob.bids.size > 0 && ob.asks.size > 0;
 
-    // Relaxed criteria: If we have a fresh snapshot and a populated book, we are LIVE.
-    // We ignore goodSequenceStreak and desyncRate for state transition blocking, 
-    // effectively mimicking c4c8a70 behavior where snapshot -> LIVE immediately.
-    const live = snapshotFresh && hasBook;
+    // Data Liveness: Check if depth messages are flowing within GRACE_PERIOD
+    // If we just resynced, give it time (MIN_RESYNC_INTERVAL check handles throttle)
+    const dataFlowing = (now - meta.lastDepthMsgTs) < GRACE_PERIOD_MS;
 
-    recordLiveSample(symbol, live);
+    // Primary Condition: Fresh Snapshot + Populated Book
+    // Secondary Condition: Data is flowing OR we are within throttle window (just restarted)
+    const isLiveCondition = snapshotFresh && hasBook;
 
-    if (live) {
-        transitionOrderbookState(symbol, 'LIVE', 'live_criteria_met_relaxed', {
-            lastSnapshotOkMsAgo: now - meta.lastSnapshotOk,
-            queueLen: meta.depthQueue.length,
-            goodSequenceStreak: meta.goodSequenceStreak
-        });
+    if (isLiveCondition) {
+        // We look good foundationally. Check data flow.
+        if (ob.uiState !== 'LIVE') {
+            transitionOrderbookState(symbol, 'LIVE', 'live_criteria_met', {
+                fresh: snapshotFresh,
+                dataLag: now - meta.lastDepthMsgTs
+            });
+        }
+        recordLiveSample(symbol, true);
     } else {
-        transitionOrderbookState(symbol, 'RESYNCING', 'live_criteria_not_met', {
-            hasBook,
-            snapshotFresh,
-            lastSnapshotOkMsAgo: meta.lastSnapshotOk > 0 ? (now - meta.lastSnapshotOk) : null,
-        });
+        recordLiveSample(symbol, false);
+
+        // Trigger Resync only if allowed by throttle
+        const timeSinceResync = now - meta.lastResyncTs;
+        const canResync = timeSinceResync > MIN_RESYNC_INTERVAL_MS;
+
+        if (canResync && !meta.isResyncing) {
+            meta.lastResyncTs = now;
+            // Only transition if we are actually going to fetch
+            transitionOrderbookState(symbol, 'RESYNCING', 'live_criteria_failed_throttled', {
+                fresh: snapshotFresh,
+                dataLag: now - meta.lastDepthMsgTs,
+                hasBook,
+                timeSinceResync
+            });
+            fetchSnapshot(symbol, 'watchdog_resync', true).catch(() => { });
+        }
     }
 }
+
 
 function emitBlockedReasonTelemetry(symbol: string) {
     const meta = getMeta(symbol);
