@@ -119,7 +119,7 @@ interface SymbolMeta {
     metricsBroadcastCount10s: number;
     metricsBroadcastDepthCount10s: number;
     metricsBroadcastTradeCount10s: number;
-    lastMetricsBroadcastReason: string;
+    lastMetricsBroadcastReason: 'depth' | 'trade' | 'none';
     applyCount10s: number;
     // Reliability
     depthQueue: Array<{
@@ -268,14 +268,6 @@ function transitionOrderbookState(symbol: string, to: OrderbookState['uiState'],
         meta.lastLiveTs = meta.lastStateTransitionTs;
     }
     log('ORDERBOOK_STATE_TRANSITION', { symbol, from, to, trigger, ...detail });
-
-    // Broadcast state change immediately so UI reflects it
-    const tas = getTaS(symbol);
-    const cvd = getCvd(symbol);
-    const abs = getAbs(symbol);
-    const leg = getLegacy(symbol);
-    const absVal = absorptionResult.get(symbol) ?? 0;
-    broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, Date.now(), 'state_change');
 }
 
 // Lazy Metric Getters
@@ -503,7 +495,7 @@ function updateStreams() {
                 setTimeout(() => {
                     fetchSnapshot(symbol, 'ws_open_seed', true).catch(() => { });
                 }, delay);
-                delay += 2500; // Increased delay to 2.5s to be safer against rate limits
+                delay += 1000;
             }
         });
     });
@@ -811,7 +803,7 @@ function broadcastMetrics(
     absVal: number,
     leg: LegacyCalculator,
     eventTimeMs: number,
-    reason: string = 'trade'
+    reason: 'depth' | 'trade' = 'trade'
 ) {
     const THROTTLE_MS = 250; // 4Hz max per symbol
     const meta = getMeta(s);
