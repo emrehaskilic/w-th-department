@@ -36,6 +36,15 @@ import {
 import { LegacyCalculator } from './metrics/LegacyCalculator';
 import { createOrchestratorFromEnv } from './orchestrator/Orchestrator';
 
+// [PHASE 1 & 2] New Imports
+import { KlineBackfill } from './backfill/KlineBackfill';
+import { OICalculator } from './metrics/OICalculator';
+import { SymbolEventQueue } from './utils/SymbolEventQueue';
+import { SnapshotTracker } from './telemetry/Snapshot';
+import { StrategyEngine } from './strategy/StrategyEngine';
+import { RiskManager } from './risk/RiskManager';
+import { BinanceExecutor } from './execution/BinanceExecutor';
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -78,6 +87,11 @@ const WS_UPDATE_SPEED = String(process.env.WS_UPDATE_SPEED || '250ms'); // 100ms
 const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
 const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
+
+// [PHASE 3] Execution Flags
+let KILL_SWITCH = false;
+const EXECUTION_ENABLED = process.env.EXECUTION_ENABLED === 'true';
+const EXECUTION_MODE = (process.env.EXECUTION_MODE || 'dry-run') as 'live' | 'dry-run';
 
 // =============================================================================
 // Logging
@@ -137,6 +151,10 @@ interface SymbolMeta {
     snapshotOkEvents: number[];
     snapshotSkipEvents: number[];
     liveSamples: Array<{ ts: number; live: boolean }>;
+    // [PHASE 1] Deterministic Queue
+    eventQueue: SymbolEventQueue;
+    // [PHASE 1] Snapshot tracker
+    snapshotTracker: SnapshotTracker;
 }
 
 const symbolMeta = new Map<string, SymbolMeta>();
@@ -154,6 +172,13 @@ const lastOpenInterest = new Map<string, OpenInterestMetrics>();
 const lastFunding = new Map<string, FundingMetrics>();
 const oiMonitors = new Map<string, OpenInterestMonitor>();
 const fundingMonitors = new Map<string, FundingMonitor>();
+
+// [PHASE 1 & 2] New Maps
+const backfillMap = new Map<string, KlineBackfill>();
+const oiCalculatorMap = new Map<string, OICalculator>();
+const strategyMap = new Map<string, StrategyEngine>();
+const riskMap = new Map<string, RiskManager>();
+const executorMap = new Map<string, BinanceExecutor>();
 const orchestrator = createOrchestratorFromEnv();
 
 // Cached Exchange Info
@@ -203,7 +228,13 @@ function getMeta(symbol: string): SymbolMeta {
             desyncEvents: [],
             snapshotOkEvents: [],
             snapshotSkipEvents: [],
-            liveSamples: []
+            liveSamples: [],
+            // [PHASE 1] Deterministic Queue
+            eventQueue: new SymbolEventQueue(symbol, async (ev) => {
+                await processSymbolEvent(symbol, ev);
+            }),
+            // [PHASE 1] Snapshot tracker
+            snapshotTracker: new SnapshotTracker(),
         };
         symbolMeta.set(symbol, meta);
     }
@@ -273,13 +304,29 @@ const getCvd = (s: string) => { if (!cvdMap.has(s)) cvdMap.set(s, new CvdCalcula
 const getAbs = (s: string) => { if (!absorptionMap.has(s)) absorptionMap.set(s, new AbsorptionDetector()); return absorptionMap.get(s)!; };
 const getLegacy = (s: string) => { if (!legacyMap.has(s)) legacyMap.set(s, new LegacyCalculator(s)); return legacyMap.get(s)!; };
 
-function ensureMonitors(symbol: string) {
-    // Open Interest is now managed by LegacyCalculator
-    /*
-    if (!oiMonitors.has(symbol)) {
-       // Deprecated
+// [PHASE 1 & 2] New Getters
+const getBackfill = (s: string) => { if (!backfillMap.has(s)) backfillMap.set(s, new KlineBackfill(s, BINANCE_REST_BASE)); return backfillMap.get(s)!; };
+const getOICalc = (s: string) => { if (!oiCalculatorMap.has(s)) oiCalculatorMap.set(s, new OICalculator(s, BINANCE_REST_BASE)); return oiCalculatorMap.get(s)!; };
+const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s, new StrategyEngine()); return strategyMap.get(s)!; };
+const getRisk = (s: string) => { if (!riskMap.has(s)) riskMap.set(s, new RiskManager()); return riskMap.get(s)!; };
+const getExecutor = (s: string) => {
+    if (!executorMap.has(s)) {
+        executorMap.set(s, new BinanceExecutor(orchestrator.getConnector() as any, EXECUTION_ENABLED, EXECUTION_MODE));
     }
-    */
+    return executorMap.get(s)!;
+};
+
+function ensureMonitors(symbol: string) {
+    if (!backfillMap.has(symbol)) {
+        const bf = getBackfill(symbol);
+        bf.performBackfill().catch(e => log('BACKFILL_ERROR', { symbol, error: e.message }));
+    }
+
+    if (!oiCalculatorMap.has(symbol)) {
+        const oi = getOICalc(symbol);
+        oi.update().catch(e => log('OI_INIT_ERROR', { symbol, error: e.message }));
+    }
+
     if (!fundingMonitors.has(symbol)) {
         const m = new FundingMonitor(symbol);
         m.onUpdate(d => lastFunding.set(symbol, d));
@@ -300,7 +347,7 @@ async function fetchExchangeInfo() {
         log('EXCHANGE_INFO_REQ', { url: `${BINANCE_REST_BASE}/fapi/v1/exchangeInfo` });
         const res = await fetch(`${BINANCE_REST_BASE}/fapi/v1/exchangeInfo`);
         if (!res.ok) throw new Error(`Status ${res.status}`);
-        const data = await res.json();
+        const data: any = await res.json();
         const symbols = data.symbols
             .filter((s: any) => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT')
             .map((s: any) => s.symbol).sort();
@@ -664,46 +711,37 @@ function runAutoScaler() {
     autoScaleLastUpTs = 0;
 }
 
-function handleMsg(raw: any) {
-    let msg: any;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (!msg.data) return;
-
-    const d = msg.data;
+async function processSymbolEvent(s: string, d: any) {
     const e = d.e;
-    const s = d.s;
-    if (!s) return;
+    const ob = getOrderbook(s);
+    const meta = getMeta(s);
+    const now = Date.now();
 
     if (e === 'depthUpdate') {
-        const meta = getMeta(s);
         meta.depthMsgCount++;
         meta.depthMsgCount10s++;
-        meta.lastDepthMsgTs = Date.now();
+        meta.lastDepthMsgTs = now;
 
-        // Ensure Monitors are running
         ensureMonitors(s);
         enqueueDepthUpdate(s, {
             U: Number(d.U || 0),
             u: Number(d.u || 0),
             b: Array.isArray(d.b) ? d.b : [],
             a: Array.isArray(d.a) ? d.a : [],
-            eventTimeMs: Number(d.E || d.T || Date.now()),
-            receiptTimeMs: Date.now(),
+            eventTimeMs: Number(d.E || d.T || now),
+            receiptTimeMs: now,
         });
     } else if (e === 'trade') {
-        // Trade Tape - Independent of Orderbook State
-        const meta = getMeta(s);
         meta.tradeMsgCount++;
         const p = parseFloat(d.p);
         const q = parseFloat(d.q);
         const t = d.T;
-        const side = d.m ? 'sell' : 'buy'; // Maker=Buyer => Seller is Taker (Sell)
+        const side = d.m ? 'sell' : 'buy';
 
         const tas = getTaS(s);
         const cvd = getCvd(s);
         const abs = getAbs(s);
         const leg = getLegacy(s);
-        const ob = getOrderbook(s);
 
         tas.addTrade({ price: p, quantity: q, side, timestamp: t });
         cvd.addTrade({ price: p, quantity: q, side, timestamp: t });
@@ -713,9 +751,63 @@ function handleMsg(raw: any) {
         const absVal = abs.addTrade(s, p, side, t, levelSize);
         absorptionResult.set(s, absVal);
 
+        // [PHASE 2] Strategy Check
+        const strategy = getStrategy(s);
+        const backfill = getBackfill(s);
+        const legMetrics = leg.computeMetrics(ob);
+        const cvdMetrics = cvd.computeMetrics();
+        const cvd1m = cvdMetrics.find(x => x.timeframe === '1m');
+
+        const signal = strategy.compute({
+            price: p,
+            atr: backfill.getState().atr,
+            recentHigh: backfill.getState().recentHigh,
+            recentLow: backfill.getState().recentLow,
+            obi: legMetrics?.obiDeep || 0,
+            deltaZ: legMetrics?.deltaZ || 0,
+            cvdSlope: legMetrics?.cvdSlope || 0,
+            ready: backfill.getState().ready,
+            vetoReason: backfill.getState().vetoReason
+        });
+
+        // [PHASE 3] Execution Check
+        if (signal.signal && !KILL_SWITCH && EXECUTION_ENABLED) {
+            const risk = getRisk(s);
+            const executor = getExecutor(s);
+            const side: 'BUY' | 'SELL' = (signal.signal === 'BREAKOUT_LONG' || signal.signal === 'SWEEP_FADE_LONG') ? 'BUY' : 'SELL';
+
+            const riskCheck = risk.check(s, side, p, q); // basic Qty for now
+            if (riskCheck.ok) {
+                risk.recordTrade(s);
+                executor.execute({
+                    symbol: s,
+                    side,
+                    price: p,
+                    quantity: q, // Placeholder Qty logic
+                    dryRun: EXECUTION_MODE === 'dry-run'
+                }).then(res => {
+                    log('EXECUTION_RESULT', { symbol: s, signal: signal.signal, ...res });
+                });
+            } else {
+                log('RISK_VETO', { symbol: s, signal: signal.signal, reason: riskCheck.reason });
+            }
+        }
+
         // Broadcast
-        broadcastMetrics(s, ob, tas, cvd, absVal, leg, t);
+        broadcastMetrics(s, ob, tas, cvd, absVal, leg, t, signal);
     }
+}
+
+function handleMsg(raw: any) {
+    let msg: any;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (!msg.data) return;
+
+    const s = msg.data.s;
+    if (!s) return;
+
+    const meta = getMeta(s);
+    meta.eventQueue.enqueue(msg.data);
 }
 
 function broadcastMetrics(
@@ -726,6 +818,7 @@ function broadcastMetrics(
     absVal: number,
     leg: LegacyCalculator,
     eventTimeMs: number,
+    signal: any = null,
     reason: 'depth' | 'trade' = 'trade'
 ) {
     const THROTTLE_MS = 250; // 4Hz max per symbol
@@ -756,22 +849,40 @@ function broadcastMetrics(
         ? ((bestAskPx - bestBidPx) / mid) * 100
         : null;
 
-    const payload = {
+    const oiM = getOICalc(s).getMetrics();
+    const bf = getBackfill(s).getState();
+
+    const payload: any = {
         type: 'metrics',
         symbol: s,
-        event_time_ms: eventTimeMs,
         state: ob.uiState,
+        event_time_ms: eventTimeMs,
+        snapshot: meta.snapshotTracker.next({ s, mid }),
         timeAndSales: tasMetrics,
         cvd: {
             tf1m: cvdM.find(x => x.timeframe === '1m') || { cvd: 0, delta: 0 },
             tf5m: cvdM.find(x => x.timeframe === '5m') || { cvd: 0, delta: 0 },
             tf15m: cvdM.find(x => x.timeframe === '15m') || { cvd: 0, delta: 0 },
-            tradeCounts: cvd.getTradeCounts() // Debug: trade counts per timeframe
+            tradeCounts: cvd.getTradeCounts()
         },
         absorption: absVal,
-        openInterest: leg ? leg.getOpenInterestMetrics() : null,
+        openInterest: {
+            openInterest: oiM.currentOI,
+            oiChangeAbs: oiM.oiChangeAbs,
+            oiChangePct: oiM.oiChangePct,
+            oiDeltaWindow: oiM.oiChangeAbs,
+            lastUpdated: oiM.lastUpdated,
+            source: 'real',
+            stabilityMsg: oiM.stabilityMsg
+        },
         funding: lastFunding.get(s) || null,
-        legacyMetrics: legacyM, // Null if unseeded
+        legacyMetrics: legacyM,
+        signalDisplay: signal || { signal: null, score: 0, vetoReason: bf.vetoReason || 'NO_SIGNAL', candidate: null },
+        advancedMetrics: {
+            sweepFadeScore: signal?.score || 0,
+            breakoutScore: signal?.score || 0,
+            volatilityIndex: bf.atr
+        },
         bids, asks,
         bestBid: bestBidPx,
         bestAsk: bestAskPx,
@@ -880,6 +991,23 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 app.get('/api/health', (req, res) => {
+    res.json({
+        ok: true,
+        executionEnabled: EXECUTION_ENABLED,
+        executionMode: EXECUTION_MODE,
+        killSwitch: KILL_SWITCH,
+        activeSymbols: Array.from(activeSymbols),
+        wsState
+    });
+});
+
+app.post('/api/kill-switch', (req, res) => {
+    KILL_SWITCH = Boolean(req.body?.enabled);
+    log('KILL_SWITCH_TOGGLED', { enabled: KILL_SWITCH });
+    res.json({ ok: true, killSwitch: KILL_SWITCH });
+});
+
+app.get('/api/status', (req, res) => {
     const now = Date.now();
     const result: any = {
         ok: true,
@@ -1094,8 +1222,18 @@ setInterval(() => {
     activeSymbols.forEach((symbol) => {
         evaluateLiveReadiness(symbol);
     });
-    // runAutoScaler();
 }, 1000);
+
+// [PHASE 1] Staggered OI Updates
+let oiTick = 0;
+setInterval(() => {
+    const symbols = Array.from(activeSymbols);
+    if (symbols.length === 0) return;
+
+    const symbolToUpdate = symbols[oiTick % symbols.length];
+    getOICalc(symbolToUpdate).update().catch(() => { });
+    oiTick++;
+}, 5000); // Update one symbol every 5s
 
 server.listen(PORT, HOST, () => log('SERVER_UP', { port: PORT, host: HOST }));
 orchestrator.start().catch((e) => {

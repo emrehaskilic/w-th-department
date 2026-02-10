@@ -2,3 +2,9 @@ node_modules/
 dist/
 .env
 .DS_Store
+*.log
+*.jsonl
+server/logs/
+server/dist/
+.idea/
+.vscode/

@@ -89,7 +89,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
       {/* Main Row - Fixed Height & Width */}
       <div
         className="grid gap-0 px-5 items-center cursor-pointer select-none h-14"
-        style={{ gridTemplateColumns: 'minmax(140px, 1fr) 120px 140px 100px 100px 100px' }}
+        style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 100px 90px 90px 120px' }}
         onClick={() => setExpanded(!expanded)}
       >
         {/* Symbol */}
@@ -139,6 +139,23 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
         <div className="flex items-center justify-center gap-1">
           <SlopeIcon value={legacyMetrics.cvdSlope} />
           <MetricValue value={legacyMetrics.cvdSlope} />
+        </div>
+
+        {/* Signal Column */}
+        <div className="flex items-center justify-center">
+          {data.signalDisplay?.signal ? (
+            <div className={`px-2 py-0.5 rounded text-[10px] font-bold border flex flex-col items-center ${data.signalDisplay.signal.includes('LONG')
+                ? 'bg-green-900/20 text-green-400 border-green-800/30'
+                : 'bg-red-900/20 text-red-400 border-red-800/30'
+              }`}>
+              {data.signalDisplay.signal.split('_')[0]}
+              <span className="text-[8px] opacity-70">SCR: {data.signalDisplay.score}</span>
+            </div>
+          ) : (
+            <span className="text-[9px] text-zinc-600 uppercase tracking-tighter truncate max-w-[80px]">
+              {data.signalDisplay?.vetoReason || 'MONITORING'}
+            </span>
+          )}
         </div>
       </div>
 
@@ -241,16 +258,59 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
                             </span>
                           </td>
                           <td className="px-4 py-3 text-center">
-                            {Math.abs(row.delta) > 500000 ? ( // Arbitrary threshold for highlight
-                              <span className="text-[9px] bg-yellow-900/20 text-yellow-500 px-1.5 py-0.5 rounded border border-yellow-800/30">HIGH VOL</span>
+                            {row.tf === '1m' && data.advancedMetrics ? (
+                              <div className="flex flex-col items-center">
+                                <span className="text-[9px] text-zinc-500">ATR-based VOL</span>
+                                <span className="text-[10px] text-zinc-300 font-mono">{data.advancedMetrics.volatilityIndex.toFixed(2)}</span>
+                              </div>
                             ) : (
-                              <span className="text-zinc-700 text-[10px]">Normal</span>
+                              <span className="text-zinc-700 text-[10px]">Stable</span>
                             )}
                           </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
+                </div>
+              </div>
+            </div>
+
+            {/* Strategy & Signal Card */}
+            <div className="bg-zinc-900/40 p-5 rounded-lg border border-zinc-800/50">
+              <div className="flex justify-between items-start mb-4">
+                <h3 className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Active Strategy Signals</h3>
+                <div className="text-[10px] font-mono text-zinc-500 px-2 py-1 bg-black/40 rounded border border-zinc-800">
+                  HASH: {data.snapshot?.stateHash.substring(0, 8)} | EV:{data.snapshot?.eventId}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div className="bg-black/20 p-3 rounded border border-zinc-800/50">
+                  <div className="text-[9px] text-zinc-600 mb-1 uppercase">Current Signal</div>
+                  <div className={`text-lg font-bold ${data.signalDisplay?.signal ? (data.signalDisplay.signal.includes('LONG') ? 'text-green-400' : 'text-red-400') : 'text-zinc-700'}`}>
+                    {data.signalDisplay?.signal || 'NONE'}
+                  </div>
+                </div>
+                <div className="bg-black/20 p-3 rounded border border-zinc-800/50">
+                  <div className="text-[9px] text-zinc-600 mb-1 uppercase">Signal Score</div>
+                  <div className="text-lg font-mono font-bold text-white">
+                    {data.signalDisplay?.score || 0}%
+                  </div>
+                </div>
+                <div className="bg-black/20 p-3 rounded border border-zinc-800/50">
+                  <div className="text-[9px] text-zinc-600 mb-1 uppercase">Status / Veto</div>
+                  <div className="text-xs font-mono text-zinc-400">
+                    {data.signalDisplay?.vetoReason || 'READY'}
+                  </div>
+                </div>
+                <div className="bg-black/20 p-3 rounded border border-zinc-800/50">
+                  <div className="text-[9px] text-zinc-600 mb-1 uppercase">Candidate Entry</div>
+                  {data.signalDisplay?.candidate ? (
+                    <div className="text-xs font-mono text-blue-400 flex flex-col">
+                      <span>ENTRY: {data.signalDisplay.candidate.entryPrice.toFixed(2)}</span>
+                      <span className="text-[9px] text-zinc-500">TP: {data.signalDisplay.candidate.tpPrice.toFixed(2)}</span>
+                    </div>
+                  ) : <div className="text-xs text-zinc-700 italic">No entry set</div>}
                 </div>
               </div>
             </div>

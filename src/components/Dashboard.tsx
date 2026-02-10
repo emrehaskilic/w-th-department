@@ -312,13 +312,14 @@ export const Dashboard: React.FC = () => {
         <div className="border border-zinc-800 rounded-xl overflow-hidden bg-zinc-900/80 shadow-2xl">
           <div className="overflow-x-auto">
             <div className="min-w-[900px]">
-              <div className="grid gap-0 px-5 py-4 text-[11px] font-bold text-zinc-500 uppercase tracking-widest bg-zinc-900 border-b border-zinc-800" style={{ gridTemplateColumns: 'minmax(140px, 1fr) 120px 140px 100px 100px 100px' }}>
+              <div className="grid gap-0 px-5 py-4 text-[11px] font-bold text-zinc-500 uppercase tracking-widest bg-zinc-900 border-b border-zinc-800" style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 100px 90px 90px 120px' }}>
                 <div>Symbol</div>
                 <div className="text-right">Price</div>
                 <div className="text-right">OI / Change</div>
                 <div className="text-center">OBI (10L)</div>
                 <div className="text-center">Delta Z</div>
                 <div className="text-center">CVD Slope</div>
+                <div className="text-center">Signal</div>
               </div>
               <div className="bg-black/20 divide-y divide-zinc-900">
                 {activeSymbols.map((symbol) => {

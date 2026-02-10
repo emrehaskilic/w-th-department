@@ -1,14 +1,19 @@
-// Metrics types shared between the frontend and backend.  These
-// interfaces describe the shape of the WebSocket messages emitted by
-// the server and the structures stored in the UI state.  Do not
-// compute any values on the client; the server must populate all
-// fields.
+export interface SignalDisplay {
+  signal: 'SWEEP_FADE_LONG' | 'SWEEP_FADE_SHORT' | 'BREAKOUT_LONG' | 'BREAKOUT_SHORT' | null;
+  score: number;
+  vetoReason: string | null;
+  candidate: {
+    entryPrice: number;
+    tpPrice: number;
+    slPrice: number;
+  } | null;
+}
 
-/**
- * Per‐timeframe cumulative volume delta (CVD) metrics.  Each
- * timeframe includes the cumulative delta, the delta over the
- * interval and an exhaustion flag indicating diminishing returns.
- */
+export interface SnapshotMetadata {
+  eventId: number;
+  stateHash: string;
+  ts: number;
+}
 export interface CvdTfMetrics {
   cvd: number;
   delta: number;
@@ -68,6 +73,7 @@ export interface OpenInterestMetrics {
   oiDeltaWindow: number;
   lastUpdated: number;
   source: 'real' | 'mock';
+  stabilityMsg?: string;
 }
 
 /**
@@ -93,6 +99,7 @@ export interface MetricsMessage {
   type: 'metrics';
   symbol: string;
   state: 'LIVE' | 'STALE' | 'RESYNCING';
+  snapshot: SnapshotMetadata;
   timeAndSales: TimeAndSalesMetrics;
   cvd: {
     tf1m: CvdTfMetrics;
@@ -103,6 +110,12 @@ export interface MetricsMessage {
   openInterest: OpenInterestMetrics | null;
   funding: FundingContext | null;
   legacyMetrics: LegacyMetrics;
+  signalDisplay: SignalDisplay;
+  advancedMetrics: {
+    sweepFadeScore: number;
+    breakoutScore: number;
+    volatilityIndex: number;
+  };
   bids: [number, number, number][];
   asks: [number, number, number][];
   midPrice: number | null;

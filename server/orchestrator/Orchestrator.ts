@@ -27,6 +27,10 @@ export class Orchestrator {
     });
   }
 
+  getConnector() {
+    return this.connector;
+  }
+
   async start() {
     await this.connector.start();
   }
