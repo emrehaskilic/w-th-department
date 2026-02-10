@@ -59,7 +59,7 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
       </div>
 
       {/* Key metrics - Always visible */}
-      <div className="grid grid-cols-4 gap-1 px-4 pb-3 text-xs">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 px-4 pb-3 text-xs">
         <div className="text-center p-2 bg-zinc-800/30 rounded">
           <div className="text-zinc-500 text-[10px] uppercase tracking-wider">OBI W</div>
           <div className={`font-mono font-medium ${posNegClass(lm.obiWeighted)}`}>
@@ -70,6 +70,12 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
           <div className="text-zinc-500 text-[10px] uppercase tracking-wider">OBI D</div>
           <div className={`font-mono font-medium ${posNegClass(lm.obiDeep)}`}>
             {lm.obiDeep.toFixed(2)}
+          </div>
+        </div>
+        <div className="text-center p-2 bg-zinc-800/30 rounded">
+          <div className="text-zinc-500 text-[10px] uppercase tracking-wider">OBI Div</div>
+          <div className={`font-mono font-medium ${posNegClass(lm.obiDivergence)}`}>
+            {lm.obiDivergence.toFixed(2)}
           </div>
         </div>
         <div className="text-center p-2 bg-zinc-800/30 rounded">

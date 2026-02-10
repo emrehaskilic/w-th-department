@@ -32,8 +32,12 @@ interface CvdMessage {
 
 interface OpenInterestMetrics {
   openInterest: number;
-  delta: number;
+  oiChangeAbs: number;
+  oiChangePct: number;
+  oiDeltaWindow: number;
+  lastUpdated: number;
   source: 'real' | 'mock';
+  stabilityMsg?: string;
 }
 
 interface FundingMetrics {
@@ -217,15 +221,15 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ metrics, showLatency }) => {
               <div className="text-zinc-200">OI: {formatNumber(openInterest.openInterest, 2)}</div>
               <div
                 className={`text-sm ${
-                  openInterest.delta > 0
+                  openInterest.oiChangeAbs > 0
                     ? 'text-green-400'
-                    : openInterest.delta < 0
+                    : openInterest.oiChangeAbs < 0
                     ? 'text-red-400'
                     : 'text-zinc-300'
                 }`}
               >
-                Δ: {openInterest.delta > 0 ? '+' : openInterest.delta < 0 ? '-' : ''}
-                {formatNumber(Math.abs(openInterest.delta), 2)}
+                Δ: {openInterest.oiChangeAbs > 0 ? '+' : openInterest.oiChangeAbs < 0 ? '-' : ''}
+                {formatNumber(Math.abs(openInterest.oiChangeAbs), 2)}
               </div>
             </>
           ) : (

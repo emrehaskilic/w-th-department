@@ -200,9 +200,15 @@ const RightStatsPanel: React.FC<RightStatsPanelProps> = ({ metrics, showLatency 
           {openInterest ? (
             <>
               <div className="text-sm text-zinc-200">{formatNum(openInterest.openInterest, 2)}</div>
-              <div className={posNegClass(openInterest.delta)}>
-                {openInterest.delta > 0 ? '+' : openInterest.delta < 0 ? '-' : ''}{formatNum(Math.abs(openInterest.delta), 2)}
+              <div className={posNegClass(openInterest.oiChangeAbs)}>
+                {openInterest.oiChangeAbs > 0 ? '+' : openInterest.oiChangeAbs < 0 ? '-' : ''}{formatNum(Math.abs(openInterest.oiChangeAbs), 2)}
+                <span className="text-[10px] text-zinc-500 ml-1">({openInterest.oiChangePct.toFixed(2)}%)</span>
               </div>
+              {openInterest.stabilityMsg && (
+                <div className="text-[9px] text-zinc-500 mt-1">
+                  {openInterest.stabilityMsg}
+                </div>
+              )}
             </>
           ) : (
             <div className="text-zinc-500">-</div>

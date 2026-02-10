@@ -89,7 +89,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
       {/* Main Row - Fixed Height & Width */}
       <div
         className="grid gap-0 px-5 items-center cursor-pointer select-none h-14"
-        style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 100px 90px 90px 120px' }}
+        style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 90px 90px 90px 90px 90px 120px' }}
         onClick={() => setExpanded(!expanded)}
       >
         {/* Symbol */}
@@ -128,6 +128,16 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
         {/* OBI (10L) */}
         <div className="text-center">
           <MetricValue value={legacyMetrics.obiWeighted} />
+        </div>
+
+        {/* OBI (50L) */}
+        <div className="text-center">
+          <MetricValue value={legacyMetrics.obiDeep} />
+        </div>
+
+        {/* OBI Divergence */}
+        <div className="text-center">
+          <MetricValue value={legacyMetrics.obiDivergence} />
         </div>
 
         {/* Delta Z */}
