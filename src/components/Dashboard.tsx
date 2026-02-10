@@ -17,6 +17,8 @@ interface ExecutionStatus {
   selectedSymbols: string[];
   settings: {
     leverage: number;
+    totalMarginBudgetUsdt: number;
+    pairInitialMargins: Record<string, number>;
   };
   wallet: {
     totalWalletUsdt: number;
@@ -39,6 +41,8 @@ const defaultExecutionStatus: ExecutionStatus = {
   selectedSymbols: [],
   settings: {
     leverage: 10,
+    totalMarginBudgetUsdt: 0,
+    pairInitialMargins: {},
   },
   wallet: {
     totalWalletUsdt: 0,
@@ -64,6 +68,11 @@ export const Dashboard: React.FC = () => {
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   const [executionStatus, setExecutionStatus] = useState<ExecutionStatus>(defaultExecutionStatus);
+  const [leverageInput, setLeverageInput] = useState('10');
+  const [pairMarginInputs, setPairMarginInputs] = useState<Record<string, string>>({});
+  const [settingsDirty, setSettingsDirty] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsSavedAt, setSettingsSavedAt] = useState(0);
 
   const activeSymbols = useMemo(() => selectedPairs, [selectedPairs]);
   const marketData: MetricsState = useTelemetrySocket(activeSymbols);
@@ -115,6 +124,35 @@ export const Dashboard: React.FC = () => {
     const timer = window.setInterval(pollStatus, 2000);
     return () => window.clearInterval(timer);
   }, [proxyUrl]);
+
+  useEffect(() => {
+    if (settingsDirty) return;
+    setLeverageInput(String(executionStatus.settings?.leverage || 1));
+    const syncedMargins: Record<string, string> = {};
+    Object.entries(executionStatus.settings?.pairInitialMargins || {}).forEach(([symbol, margin]) => {
+      syncedMargins[symbol] = String(margin);
+    });
+    setPairMarginInputs(syncedMargins);
+  }, [executionStatus, settingsDirty]);
+
+  useEffect(() => {
+    setPairMarginInputs((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      const defaultMargin = selectedPairs.length > 0 && executionStatus.wallet.totalWalletUsdt > 0
+        ? executionStatus.wallet.totalWalletUsdt / selectedPairs.length
+        : 0;
+
+      selectedPairs.forEach((symbol) => {
+        if (typeof next[symbol] === 'undefined') {
+          next[symbol] = defaultMargin > 0 ? defaultMargin.toFixed(2) : '';
+          changed = true;
+        }
+      });
+
+      return changed ? next : prev;
+    });
+  }, [selectedPairs, executionStatus.wallet.totalWalletUsdt]);
 
   useEffect(() => {
     const syncSelectedSymbols = async () => {
@@ -184,6 +222,45 @@ export const Dashboard: React.FC = () => {
       setExecutionStatus(data.status as ExecutionStatus);
     }
   };
+
+  const applyExecutionSettings = async () => {
+    setSettingsError(null);
+    try {
+      const parsedLeverage = Number(leverageInput);
+      const pairInitialMargins: Record<string, number> = {};
+      selectedPairs.forEach((symbol) => {
+        const margin = Number(pairMarginInputs[symbol]);
+        if (Number.isFinite(margin) && margin > 0) {
+          pairInitialMargins[symbol] = margin;
+        }
+      });
+
+      const res = await fetch(`${proxyUrl}/api/execution/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          leverage: parsedLeverage,
+          pairInitialMargins,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || 'settings_update_failed');
+      }
+      setExecutionStatus(data.status as ExecutionStatus);
+      setSettingsDirty(false);
+      setSettingsSavedAt(Date.now());
+    } catch (e: any) {
+      setSettingsError(e.message || 'settings_update_failed');
+    }
+  };
+
+  const totalMarginBudgetUsdt = executionStatus.wallet.totalWalletUsdt;
+  const allocatedInitialMarginUsdt = selectedPairs.reduce((sum, symbol) => {
+    const margin = Number(pairMarginInputs[symbol]);
+    return sum + (Number.isFinite(margin) && margin > 0 ? margin : 0);
+  }, 0);
+  const remainingMarginUsdt = totalMarginBudgetUsdt - allocatedInitialMarginUsdt;
 
   const statusColor = executionStatus.connection.state === 'CONNECTED'
     ? 'text-green-400'
@@ -304,6 +381,73 @@ export const Dashboard: React.FC = () => {
                     ))}
                   </div>
                 </div>
+              )}
+            </div>
+
+            <div className="pt-3 border-t border-zinc-800 space-y-3">
+              <h3 className="text-xs font-semibold text-zinc-300">Capital Settings</h3>
+
+              <div className="grid grid-cols-2 gap-y-2 text-xs">
+                <div className="text-zinc-500">Total Margin Budget</div>
+                <div className="text-right font-mono text-white">{formatNum(totalMarginBudgetUsdt)} USDT</div>
+                <div className="text-zinc-500">Allocated Initial Margin</div>
+                <div className="text-right font-mono">{formatNum(allocatedInitialMarginUsdt)} USDT</div>
+                <div className="text-zinc-500">Remaining</div>
+                <div className={`text-right font-mono ${remainingMarginUsdt >= 0 ? 'text-zinc-300' : 'text-red-400'}`}>
+                  {formatNum(remainingMarginUsdt)} USDT
+                </div>
+              </div>
+
+              <div className="grid grid-cols-[1fr_auto] gap-2 items-end">
+                <label className="text-xs text-zinc-500">
+                  Leverage
+                  <input
+                    type="number"
+                    min={1}
+                    value={leverageInput}
+                    onChange={(e) => {
+                      setLeverageInput(e.target.value);
+                      setSettingsDirty(true);
+                    }}
+                    className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-sm font-mono"
+                  />
+                </label>
+                <button
+                  onClick={applyExecutionSettings}
+                  className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 rounded text-[11px] font-semibold border border-zinc-700"
+                >
+                  APPLY
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                <div className="text-xs text-zinc-500">Initial Margin per Selected Pair</div>
+                {selectedPairs.length === 0 && (
+                  <div className="text-[11px] text-zinc-600 italic">Select at least one pair.</div>
+                )}
+                {selectedPairs.map((symbol) => (
+                  <div key={symbol} className="grid grid-cols-[90px_1fr] gap-2 items-center">
+                    <div className="text-[11px] text-zinc-400 font-mono">{symbol}</div>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={pairMarginInputs[symbol] ?? ''}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setPairMarginInputs((prev) => ({ ...prev, [symbol]: value }));
+                        setSettingsDirty(true);
+                      }}
+                      className="bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-sm font-mono"
+                      placeholder="USDT"
+                    />
+                  </div>
+                ))}
+              </div>
+
+              {settingsError && <div className="text-xs text-red-500">{settingsError}</div>}
+              {!settingsError && settingsSavedAt > 0 && (
+                <div className="text-[10px] text-zinc-600">Settings saved: {new Date(settingsSavedAt).toLocaleTimeString()}</div>
               )}
             </div>
           </div>

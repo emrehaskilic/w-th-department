@@ -179,6 +179,9 @@ const oiCalculatorMap = new Map<string, OICalculator>();
 const strategyMap = new Map<string, StrategyEngine>();
 const riskMap = new Map<string, RiskManager>();
 const executorMap = new Map<string, BinanceExecutor>();
+const backfillInFlight = new Set<string>();
+const backfillLastAttemptMs = new Map<string, number>();
+const BACKFILL_RETRY_INTERVAL_MS = 30_000;
 const orchestrator = createOrchestratorFromEnv();
 
 // Cached Exchange Info
@@ -317,9 +320,25 @@ const getExecutor = (s: string) => {
 };
 
 function ensureMonitors(symbol: string) {
-    if (!backfillMap.has(symbol)) {
-        const bf = getBackfill(symbol);
-        bf.performBackfill().catch(e => log('BACKFILL_ERROR', { symbol, error: e.message }));
+    const backfill = getBackfill(symbol);
+    const backfillState = backfill.getState();
+    const lastBackfillAttempt = backfillLastAttemptMs.get(symbol) || 0;
+    const shouldRetryBackfill =
+        !backfillState.ready &&
+        !backfillInFlight.has(symbol) &&
+        (
+            backfillState.vetoReason === 'INITIALIZING' ||
+            Date.now() - lastBackfillAttempt >= BACKFILL_RETRY_INTERVAL_MS
+        );
+
+    if (shouldRetryBackfill) {
+        backfillInFlight.add(symbol);
+        backfillLastAttemptMs.set(symbol, Date.now());
+        backfill.performBackfill()
+            .catch(e => log('BACKFILL_ERROR', { symbol, error: e.message }))
+            .finally(() => {
+                backfillInFlight.delete(symbol);
+            });
     }
 
     if (!oiCalculatorMap.has(symbol)) {
@@ -623,7 +642,7 @@ async function processDepthQueue(symbol: string) {
             const abs = getAbs(symbol);
             const leg = getLegacy(symbol);
             const absVal = absorptionResult.get(symbol) ?? 0;
-            broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, update.eventTimeMs || 0, 'depth');
+            broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, update.eventTimeMs || 0, null, 'depth');
         }
     } finally {
         meta.isProcessingDepthQueue = false;
@@ -732,6 +751,7 @@ async function processSymbolEvent(s: string, d: any) {
             receiptTimeMs: now,
         });
     } else if (e === 'trade') {
+        ensureMonitors(s);
         meta.tradeMsgCount++;
         const p = parseFloat(d.p);
         const q = parseFloat(d.q);
@@ -755,9 +775,6 @@ async function processSymbolEvent(s: string, d: any) {
         const strategy = getStrategy(s);
         const backfill = getBackfill(s);
         const legMetrics = leg.computeMetrics(ob);
-        const cvdMetrics = cvd.computeMetrics();
-        const cvd1m = cvdMetrics.find(x => x.timeframe === '1m');
-
         const signal = strategy.compute({
             price: p,
             atr: backfill.getState().atr,
@@ -776,20 +793,50 @@ async function processSymbolEvent(s: string, d: any) {
             const executor = getExecutor(s);
             const side: 'BUY' | 'SELL' = (signal.signal === 'BREAKOUT_LONG' || signal.signal === 'SWEEP_FADE_LONG') ? 'BUY' : 'SELL';
 
-            const riskCheck = risk.check(s, side, p, q); // basic Qty for now
-            if (riskCheck.ok) {
-                risk.recordTrade(s);
-                executor.execute({
-                    symbol: s,
-                    side,
-                    price: p,
-                    quantity: q, // Placeholder Qty logic
-                    dryRun: EXECUTION_MODE === 'dry-run'
-                }).then(res => {
-                    log('EXECUTION_RESULT', { symbol: s, signal: signal.signal, ...res });
-                });
+            const executionStatus = orchestrator.getExecutionStatus();
+            const configuredLeverage = Number(executionStatus.settings?.leverage || 1);
+            const totalMarginBudgetUsdt = Number(executionStatus.settings?.totalMarginBudgetUsdt || 0);
+            const pairInitialMargins = executionStatus.settings?.pairInitialMargins || {};
+            const selectedSymbolCount = Math.max(1, executionStatus.selectedSymbols?.length || 0);
+            const fallbackPairMargin = totalMarginBudgetUsdt > 0 ? totalMarginBudgetUsdt / selectedSymbolCount : 0;
+            const configuredPairMargin = Number(pairInitialMargins[s]);
+            const pairMarginUsdt = Number.isFinite(configuredPairMargin) && configuredPairMargin > 0
+                ? configuredPairMargin
+                : fallbackPairMargin;
+
+            const notionalUsdt = pairMarginUsdt > 0 ? pairMarginUsdt * Math.max(1, configuredLeverage) : 0;
+            const sizedQty = notionalUsdt > 0 && p > 0
+                ? Number((notionalUsdt / p).toFixed(6))
+                : q;
+
+            if (!(sizedQty > 0)) {
+                log('EXECUTION_VETO', { symbol: s, signal: signal.signal, reason: 'INVALID_SIZED_QTY' });
             } else {
-                log('RISK_VETO', { symbol: s, signal: signal.signal, reason: riskCheck.reason });
+                const riskCheck = risk.check(s, side, p, sizedQty, {
+                    maxPositionNotionalUsdt: notionalUsdt > 0 ? notionalUsdt * 1.02 : undefined,
+                });
+                if (riskCheck.ok) {
+                    risk.recordTrade(s);
+                    executor.execute({
+                        symbol: s,
+                        side,
+                        price: p,
+                        quantity: sizedQty,
+                        dryRun: EXECUTION_MODE === 'dry-run'
+                    }).then(res => {
+                        log('EXECUTION_RESULT', {
+                            symbol: s,
+                            signal: signal.signal,
+                            leverage: configuredLeverage,
+                            pairMarginUsdt,
+                            notionalUsdt,
+                            quantity: sizedQty,
+                            ...res
+                        });
+                    });
+                } else {
+                    log('RISK_VETO', { symbol: s, signal: signal.signal, reason: riskCheck.reason });
+                }
             }
         }
 
@@ -1164,8 +1211,20 @@ app.post('/api/execution/symbol', async (req, res) => {
 });
 
 app.post('/api/execution/settings', async (req, res) => {
+    const rawPairMargins = (req.body && typeof req.body.pairInitialMargins === 'object' && req.body.pairInitialMargins !== null)
+        ? req.body.pairInitialMargins
+        : {};
+    const pairInitialMargins: Record<string, number> = {};
+    Object.entries(rawPairMargins).forEach(([symbol, raw]) => {
+        const margin = Number(raw);
+        if (Number.isFinite(margin) && margin > 0) {
+            pairInitialMargins[String(symbol).toUpperCase()] = margin;
+        }
+    });
+
     const settings = await orchestrator.updateCapitalSettings({
         leverage: Number(req.body?.leverage),
+        pairInitialMargins,
     });
     res.json({ ok: true, settings, status: orchestrator.getExecutionStatus() });
 });

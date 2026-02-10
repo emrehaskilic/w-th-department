@@ -16,7 +16,13 @@ export class RiskManager {
         this.config = config;
     }
 
-    public check(symbol: string, side: 'BUY' | 'SELL', price: number, quantity: number): { ok: boolean; reason: string | null } {
+    public check(
+        symbol: string,
+        side: 'BUY' | 'SELL',
+        price: number,
+        quantity: number,
+        options?: { maxPositionNotionalUsdt?: number }
+    ): { ok: boolean; reason: string | null } {
         const now = Date.now();
         const lastTs = this.lastTradeTs.get(symbol) || 0;
 
@@ -25,7 +31,10 @@ export class RiskManager {
         }
 
         const notional = price * quantity;
-        if (notional > this.config.maxPositionNotionalUsdt) {
+        const notionalLimit = Number.isFinite(options?.maxPositionNotionalUsdt as number)
+            ? Math.max(0, Number(options?.maxPositionNotionalUsdt))
+            : this.config.maxPositionNotionalUsdt;
+        if (notional > notionalLimit) {
             return { ok: false, reason: 'EXCEEDS_MAX_NOTIONAL' };
         }
 

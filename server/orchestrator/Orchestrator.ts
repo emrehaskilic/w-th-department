@@ -10,6 +10,8 @@ export class Orchestrator {
 
   private capitalSettings = {
     leverage: 10,
+    totalMarginBudgetUsdt: 0,
+    pairInitialMargins: {} as Record<string, number>,
   };
 
   constructor(
@@ -52,6 +54,7 @@ export class Orchestrator {
     // Get current balances from connector cache (synced via refresh/syncState)
     totalWallet = this.connector.getWalletBalance() || 0;
     totalAvailable = this.connector.getAvailableBalance() || 0;
+    this.capitalSettings.totalMarginBudgetUsdt = Math.max(0, totalWallet);
 
     for (const sym of selectedSymbols) {
       totalRealized += this.realizedPnlBySymbol.get(sym) || 0;
@@ -60,7 +63,11 @@ export class Orchestrator {
     return {
       connection: connectorStatus,
       selectedSymbols,
-      settings: this.capitalSettings,
+      settings: {
+        leverage: this.capitalSettings.leverage,
+        totalMarginBudgetUsdt: this.capitalSettings.totalMarginBudgetUsdt,
+        pairInitialMargins: { ...this.capitalSettings.pairInitialMargins },
+      },
       wallet: {
         totalWalletUsdt: totalWallet,
         availableBalanceUsdt: totalAvailable,
@@ -76,12 +83,31 @@ export class Orchestrator {
 
   async updateCapitalSettings(input: {
     leverage?: number;
+    pairInitialMargins?: Record<string, number>;
   }) {
     if (typeof input.leverage === 'number' && Number.isFinite(input.leverage) && input.leverage > 0) {
       this.capitalSettings.leverage = Math.min(input.leverage, this.config.maxLeverage);
       this.connector.setPreferredLeverage(this.capitalSettings.leverage);
     }
-    return this.capitalSettings;
+
+    if (input.pairInitialMargins && typeof input.pairInitialMargins === 'object') {
+      const normalized: Record<string, number> = {};
+      for (const [symbol, rawMargin] of Object.entries(input.pairInitialMargins)) {
+        const margin = Number(rawMargin);
+        if (Number.isFinite(margin) && margin > 0) {
+          normalized[symbol.toUpperCase()] = margin;
+        }
+      }
+      this.capitalSettings.pairInitialMargins = normalized;
+    }
+
+    this.capitalSettings.totalMarginBudgetUsdt = Math.max(0, this.connector.getWalletBalance() || 0);
+
+    return {
+      leverage: this.capitalSettings.leverage,
+      totalMarginBudgetUsdt: this.capitalSettings.totalMarginBudgetUsdt,
+      pairInitialMargins: { ...this.capitalSettings.pairInitialMargins },
+    };
   }
 
   async setExecutionEnabled(enabled: boolean) {
@@ -145,4 +171,3 @@ export function createOrchestratorFromEnv(): Orchestrator {
     loggerDropHaltThreshold: Number(process.env.LOGGER_DROP_HALT_THRESHOLD || 500),
   });
 }
-
