@@ -52,11 +52,11 @@ export class StrategyEngine {
 
     private checkSweepFade(inputs: StrategyInputs): StrategySignal {
         const { price, recentHigh, recentLow, atr, obi, deltaZ } = inputs;
-        const threshold = atr * 0.2; // Minor breach
+        const threshold = atr * 0.35; // Minor breach (slightly looser)
 
         // Sweep High (Short Opportunity)
         if (price > recentHigh && price < recentHigh + threshold) {
-            if (obi < -0.3 && deltaZ < -1) {
+            if (obi < -0.2 && deltaZ < -0.6) {
                 return {
                     signal: 'SWEEP_FADE_SHORT',
                     score: 75,
@@ -72,7 +72,7 @@ export class StrategyEngine {
 
         // Sweep Low (Long Opportunity)
         if (price < recentLow && price > recentLow - threshold) {
-            if (obi > 0.3 && deltaZ > 1) {
+            if (obi > 0.2 && deltaZ > 0.6) {
                 return {
                     signal: 'SWEEP_FADE_LONG',
                     score: 75,
@@ -94,7 +94,7 @@ export class StrategyEngine {
 
         // Breakout High
         if (price > recentHigh) {
-            if (obi > 0.5 && cvdSlope > 0 && deltaZ > 1.5) {
+            if (obi > 0.35 && cvdSlope > 0 && deltaZ > 0.9) {
                 return {
                     signal: 'BREAKOUT_LONG',
                     score: 85,
@@ -110,7 +110,7 @@ export class StrategyEngine {
 
         // Breakout Low
         if (price < recentLow) {
-            if (obi < -0.5 && cvdSlope < 0 && deltaZ < -1.5) {
+            if (obi < -0.35 && cvdSlope < 0 && deltaZ < -0.9) {
                 return {
                     signal: 'BREAKOUT_SHORT',
                     score: 85,
