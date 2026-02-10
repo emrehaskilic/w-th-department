@@ -17,6 +17,7 @@ export interface SnapshotMetadata {
 export interface CvdTfMetrics {
   cvd: number;
   delta: number;
+  state: 'Normal' | 'High Vol' | 'Extreme';
 }
 
 /**

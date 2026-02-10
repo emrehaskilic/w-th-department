@@ -145,8 +145,8 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
         <div className="flex items-center justify-center">
           {data.signalDisplay?.signal ? (
             <div className={`px-2 py-0.5 rounded text-[10px] font-bold border flex flex-col items-center ${data.signalDisplay.signal.includes('LONG')
-                ? 'bg-green-900/20 text-green-400 border-green-800/30'
-                : 'bg-red-900/20 text-red-400 border-red-800/30'
+              ? 'bg-green-900/20 text-green-400 border-green-800/30'
+              : 'bg-red-900/20 text-red-400 border-red-800/30'
               }`}>
               {data.signalDisplay.signal.split('_')[0]}
               <span className="text-[8px] opacity-70">SCR: {data.signalDisplay.score}</span>
@@ -258,14 +258,17 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
                             </span>
                           </td>
                           <td className="px-4 py-3 text-center">
-                            {row.tf === '1m' && data.advancedMetrics ? (
-                              <div className="flex flex-col items-center">
-                                <span className="text-[9px] text-zinc-500">ATR-based VOL</span>
-                                <span className="text-[10px] text-zinc-300 font-mono">{data.advancedMetrics.volatilityIndex.toFixed(2)}</span>
-                              </div>
-                            ) : (
-                              <span className="text-zinc-700 text-[10px]">Stable</span>
-                            )}
+                            <div className="flex flex-col items-center gap-1">
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded border ${row.state === 'Extreme' ? 'bg-red-900/20 text-red-400 border-red-800/30' :
+                                  row.state === 'High Vol' ? 'bg-yellow-900/20 text-yellow-500 border-yellow-800/30' :
+                                    'bg-zinc-800/50 text-zinc-500 border-zinc-700/30'
+                                }`}>
+                                {row.state}
+                              </span>
+                              {row.tf === '1m' && data.advancedMetrics && (
+                                <span className="text-[8px] text-zinc-600 font-mono">ATR: {data.advancedMetrics.volatilityIndex.toFixed(2)}</span>
+                              )}
+                            </div>
                           </td>
                         </tr>
                       ))}

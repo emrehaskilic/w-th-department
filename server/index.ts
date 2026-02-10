@@ -798,6 +798,13 @@ async function processSymbolEvent(s: string, d: any) {
     }
 }
 
+function classifyCVDState(delta: number): 'Normal' | 'High Vol' | 'Extreme' {
+    const absD = Math.abs(delta);
+    if (absD > 1000000) return 'Extreme';
+    if (absD > 250000) return 'High Vol';
+    return 'Normal';
+}
+
 function handleMsg(raw: any) {
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -860,9 +867,9 @@ function broadcastMetrics(
         snapshot: meta.snapshotTracker.next({ s, mid }),
         timeAndSales: tasMetrics,
         cvd: {
-            tf1m: cvdM.find(x => x.timeframe === '1m') || { cvd: 0, delta: 0 },
-            tf5m: cvdM.find(x => x.timeframe === '5m') || { cvd: 0, delta: 0 },
-            tf15m: cvdM.find(x => x.timeframe === '15m') || { cvd: 0, delta: 0 },
+            tf1m: cvdM.find(x => x.timeframe === '1m') ? { ...cvdM.find(x => x.timeframe === '1m')!, state: classifyCVDState(cvdM.find(x => x.timeframe === '1m')!.delta) } : { cvd: 0, delta: 0, state: 'Normal' },
+            tf5m: cvdM.find(x => x.timeframe === '5m') ? { ...cvdM.find(x => x.timeframe === '5m')!, state: classifyCVDState(cvdM.find(x => x.timeframe === '5m')!.delta) } : { cvd: 0, delta: 0, state: 'Normal' },
+            tf15m: cvdM.find(x => x.timeframe === '15m') ? { ...cvdM.find(x => x.timeframe === '15m')!, state: classifyCVDState(cvdM.find(x => x.timeframe === '15m')!.delta) } : { cvd: 0, delta: 0, state: 'Normal' },
             tradeCounts: cvd.getTradeCounts()
         },
         absorption: absVal,
@@ -1224,16 +1231,27 @@ setInterval(() => {
     });
 }, 1000);
 
-// [PHASE 1] Staggered OI Updates
+// [PHASE 1] Rate-limit aware staggered OI Updates
 let oiTick = 0;
-setInterval(() => {
+function scheduleNextOIPoll() {
     const symbols = Array.from(activeSymbols);
-    if (symbols.length === 0) return;
+    if (symbols.length > 0) {
+        const symbolToUpdate = symbols[oiTick % symbols.length];
+        getOICalc(symbolToUpdate).update().catch(() => { });
+        oiTick++;
+    }
 
-    const symbolToUpdate = symbols[oiTick % symbols.length];
-    getOICalc(symbolToUpdate).update().catch(() => { });
-    oiTick++;
-}, 5000); // Update one symbol every 5s
+    // Target cycle: Each symbol updated every 30 seconds.
+    const symbolCount = Math.max(1, symbols.length);
+    const targetCycleSeconds = 30;
+    let delay = (targetCycleSeconds * 1000) / symbolCount;
+    delay = Math.max(1000, Math.min(delay, 15000)); // Clamp between 1s and 15s
+
+    // Add jitter (±10%)
+    const jitter = delay * 0.1 * (Math.random() - 0.5);
+    setTimeout(scheduleNextOIPoll, delay + jitter);
+}
+scheduleNextOIPoll();
 
 server.listen(PORT, HOST, () => log('SERVER_UP', { port: PORT, host: HOST }));
 orchestrator.start().catch((e) => {
