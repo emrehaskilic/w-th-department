@@ -27,6 +27,7 @@ function baseState(): SymbolState {
     position: null,
     openOrders: new Map(),
     hasOpenEntryOrder: false,
+    pendingEntry: false,
     cooldown_until_ms: 0,
     last_exit_event_time_ms: 0,
     marginRatio: 1,

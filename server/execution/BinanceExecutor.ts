@@ -5,6 +5,7 @@ export interface ExecutionDecision {
     side: 'BUY' | 'SELL';
     price: number;
     quantity: number;
+    reduceOnly?: boolean;
 }
 
 export class BinanceExecutor {
@@ -20,15 +21,12 @@ export class BinanceExecutor {
         }
 
         try {
-            // Place LIMIT order
-            // Note: ExecutionConnector.placeOrder implementation needed (assuming it exists or adding it)
-            // Based on previous turns, connector was simplified. Let's assume a basic method.
             const res = await (this.connector as any).placeOrder({
                 symbol: decision.symbol,
                 side: decision.side,
-                type: 'LIMIT',
+                type: 'MARKET',
                 quantity: decision.quantity,
-                price: decision.price,
+                reduceOnly: decision.reduceOnly ? true : undefined,
                 clientOrderId: `bot_${Date.now()}`
             });
             return { ok: true, orderId: res.orderId };

@@ -10,7 +10,7 @@ export class RiskManager {
 
     constructor(config: RiskConfig = {
         maxPositionNotionalUsdt: 500,
-        cooldownMs: 60_000,
+        cooldownMs: 10_000,
         maxSlippagePct: 0.1
     }) {
         this.config = config;

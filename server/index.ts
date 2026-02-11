@@ -42,8 +42,6 @@ import { OICalculator } from './metrics/OICalculator';
 import { SymbolEventQueue } from './utils/SymbolEventQueue';
 import { SnapshotTracker } from './telemetry/Snapshot';
 import { StrategyEngine } from './strategy/StrategyEngine';
-import { RiskManager } from './risk/RiskManager';
-import { BinanceExecutor } from './execution/BinanceExecutor';
 
 // =============================================================================
 // Configuration
@@ -106,16 +104,6 @@ function log(event: string, data: any = {}) {
     }));
 }
 
-type OrderAttemptReason =
-    | 'EXEC_DISABLED'
-    | 'NOT_READY'
-    | 'MISSING_KEYS'
-    | 'KILL_SWITCH'
-    | 'RISK_BLOCK'
-    | 'SIZE_ZERO'
-    | 'SENT'
-    | 'EXCHANGE_ERROR';
-
 function getExecutionGateState() {
     const status = orchestrator.getExecutionStatus();
     const connection = status.connection;
@@ -129,48 +117,6 @@ function getExecutionGateState() {
         readyReason: connection.readyReason,
         connectionState: connection.state,
     };
-}
-
-function logOrderAttemptAudit(data: {
-    reasonCode: OrderAttemptReason;
-    symbol: string;
-    side: 'BUY' | 'SELL';
-    price: number;
-    qty: number;
-    notional: number;
-    leverage: number;
-    marginBudget: number;
-    bufferBps: number;
-    error?: string;
-    readyReason?: string | null;
-}) {
-    const {
-        reasonCode,
-        symbol,
-        side,
-        price,
-        qty,
-        notional,
-        leverage,
-        marginBudget,
-        bufferBps,
-        error,
-        readyReason,
-    } = data;
-
-    log('ORDER_ATTEMPT_AUDIT', {
-        reason_code: reasonCode,
-        symbol,
-        side,
-        price,
-        qty,
-        notional,
-        leverage,
-        marginBudget,
-        bufferBps,
-        error,
-        readyReason,
-    });
 }
 
 // =============================================================================
@@ -245,12 +191,11 @@ const fundingMonitors = new Map<string, FundingMonitor>();
 const backfillMap = new Map<string, KlineBackfill>();
 const oiCalculatorMap = new Map<string, OICalculator>();
 const strategyMap = new Map<string, StrategyEngine>();
-const riskMap = new Map<string, RiskManager>();
-const executorMap = new Map<string, BinanceExecutor>();
 const backfillInFlight = new Set<string>();
 const backfillLastAttemptMs = new Map<string, number>();
 const BACKFILL_RETRY_INTERVAL_MS = 30_000;
 const orchestrator = createOrchestratorFromEnv();
+orchestrator.setKillSwitch(KILL_SWITCH);
 if (typeof process.env.EXECUTION_MODE !== 'undefined') {
     log('CONFIG_WARNING', { message: 'EXECUTION_MODE is deprecated and ignored' });
 }
@@ -393,13 +338,6 @@ const getLegacy = (s: string) => { if (!legacyMap.has(s)) legacyMap.set(s, new L
 const getBackfill = (s: string) => { if (!backfillMap.has(s)) backfillMap.set(s, new KlineBackfill(s, BINANCE_REST_BASE)); return backfillMap.get(s)!; };
 const getOICalc = (s: string) => { if (!oiCalculatorMap.has(s)) oiCalculatorMap.set(s, new OICalculator(s, BINANCE_REST_BASE)); return oiCalculatorMap.get(s)!; };
 const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s, new StrategyEngine()); return strategyMap.get(s)!; };
-const getRisk = (s: string) => { if (!riskMap.has(s)) riskMap.set(s, new RiskManager()); return riskMap.get(s)!; };
-const getExecutor = (s: string) => {
-    if (!executorMap.has(s)) {
-        executorMap.set(s, new BinanceExecutor(orchestrator.getConnector() as any));
-    }
-    return executorMap.get(s)!;
-};
 
 function ensureMonitors(symbol: string) {
     const backfill = getBackfill(symbol);
@@ -870,99 +808,7 @@ async function processSymbolEvent(s: string, d: any) {
         });
 
         // [PHASE 3] Execution Check
-        if (signal.signal) {
-            const risk = getRisk(s);
-            const executor = getExecutor(s);
-            const side: 'BUY' | 'SELL' = (signal.signal === 'BREAKOUT_LONG' || signal.signal === 'SWEEP_FADE_LONG') ? 'BUY' : 'SELL';
-
-            const executionStatus = orchestrator.getExecutionStatus();
-            const configuredLeverage = Number(executionStatus.settings?.leverage || 1);
-            const totalMarginBudgetUsdt = Number(executionStatus.settings?.totalMarginBudgetUsdt || 0);
-            const pairInitialMargins = executionStatus.settings?.pairInitialMargins || {};
-            const selectedSymbolCount = Math.max(1, executionStatus.selectedSymbols?.length || 0);
-            const fallbackPairMargin = totalMarginBudgetUsdt > 0 ? totalMarginBudgetUsdt / selectedSymbolCount : 0;
-            const configuredPairMargin = Number(pairInitialMargins[s]);
-            const pairMarginUsdt = Number.isFinite(configuredPairMargin) && configuredPairMargin > 0
-                ? configuredPairMargin
-                : fallbackPairMargin;
-
-            const notionalUsdt = pairMarginUsdt > 0 ? pairMarginUsdt * Math.max(1, configuredLeverage) : 0;
-            const sizedQty = notionalUsdt > 0 && p > 0
-                ? Number((notionalUsdt / p).toFixed(6))
-                : q;
-            const bufferBps = 0;
-
-            const auditBase = {
-                symbol: s,
-                side,
-                price: p,
-                qty: sizedQty,
-                notional: notionalUsdt,
-                leverage: configuredLeverage,
-                marginBudget: pairMarginUsdt,
-                bufferBps,
-            };
-
-            const gate = getExecutionGateState();
-            if (KILL_SWITCH) {
-                logOrderAttemptAudit({ ...auditBase, reasonCode: 'KILL_SWITCH' });
-            } else if (!EXECUTION_ENABLED) {
-                logOrderAttemptAudit({ ...auditBase, reasonCode: 'EXEC_DISABLED' });
-            } else if (!gate.hasCredentials) {
-                logOrderAttemptAudit({ ...auditBase, reasonCode: 'MISSING_KEYS' });
-            } else if (!gate.ready) {
-                logOrderAttemptAudit({ ...auditBase, reasonCode: 'NOT_READY', readyReason: gate.readyReason });
-            } else if (!(sizedQty > 0)) {
-                logOrderAttemptAudit({ ...auditBase, reasonCode: 'SIZE_ZERO' });
-            } else {
-                const riskCheck = risk.check(s, side, p, sizedQty, {
-                    maxPositionNotionalUsdt: notionalUsdt > 0 ? notionalUsdt * 1.02 : undefined,
-                });
-                if (!riskCheck.ok) {
-                    logOrderAttemptAudit({ ...auditBase, reasonCode: 'RISK_BLOCK', error: riskCheck.reason });
-                } else {
-                    risk.recordTrade(s);
-                    executor.execute({
-                        symbol: s,
-                        side,
-                        price: p,
-                        quantity: sizedQty,
-                    }).then(res => {
-                        logOrderAttemptAudit({
-                            ...auditBase,
-                            reasonCode: res.ok ? 'SENT' : 'EXCHANGE_ERROR',
-                            error: res.ok ? undefined : res.error,
-                        });
-                        log('EXECUTION_RESULT', {
-                            symbol: s,
-                            signal: signal.signal,
-                            leverage: configuredLeverage,
-                            pairMarginUsdt,
-                            notionalUsdt,
-                            quantity: sizedQty,
-                            ...res
-                        });
-                    }).catch((e: any) => {
-                        const errorMsg = e?.message || 'execution_failed';
-                        logOrderAttemptAudit({
-                            ...auditBase,
-                            reasonCode: 'EXCHANGE_ERROR',
-                            error: errorMsg,
-                        });
-                        log('EXECUTION_RESULT', {
-                            symbol: s,
-                            signal: signal.signal,
-                            leverage: configuredLeverage,
-                            pairMarginUsdt,
-                            notionalUsdt,
-                            quantity: sizedQty,
-                            ok: false,
-                            error: errorMsg,
-                        });
-                    });
-                }
-            }
-        }
+        // Execution now flows through the orchestrator (gate + decision + executor).
 
         // Broadcast
         broadcastMetrics(s, ob, tas, cvd, absVal, leg, t, signal);
@@ -1189,6 +1035,7 @@ app.get('/api/health', (req, res) => {
 
 app.post('/api/kill-switch', (req, res) => {
     KILL_SWITCH = Boolean(req.body?.enabled);
+    orchestrator.setKillSwitch(KILL_SWITCH);
     log('KILL_SWITCH_TOGGLED', { enabled: KILL_SWITCH });
     res.json({ ok: true, killSwitch: KILL_SWITCH });
 });

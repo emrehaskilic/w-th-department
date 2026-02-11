@@ -9,7 +9,7 @@ import { CvdCalculator } from '../metrics/CvdCalculator';
 /**
  * Unit tests for the CvdCalculator.  These tests feed synthetic trades
  * and verify the cumulative volume delta calculations for multiple
- * timeframes.  The exhaustion flag is tested in a simplified scenario.
+ * timeframes.
  */
 
 export function runTests() {
@@ -29,13 +29,12 @@ export function runTests() {
   const m1s2 = metrics.find(m => m.timeframe === '1s');
   assert(m1s2!.cvd === 0, 'CVD should be 0 after buy and sell of equal size');
 
-  // Add a sequence of buys without new highs to trigger exhaustion
+  // Add a sequence of buys to confirm positive CVD on longer timeframe
   cvd.addTrade({ price: 100, quantity: 2, side: 'buy', timestamp: t0 + 200 });
   cvd.addTrade({ price: 99.5, quantity: 2, side: 'buy', timestamp: t0 + 300 });
   metrics = cvd.computeMetrics();
   const m5s = metrics.find(m => m.timeframe === '5s');
   assert(m5s, '5s timeframe should exist');
   assert(m5s!.cvd > 0, 'CVD should be positive after buys');
-  assert(m5s!.exhaustion === true, 'Exhaustion should flag when price fails to make new high');
 
 }

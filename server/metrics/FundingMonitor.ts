@@ -66,7 +66,7 @@ export class FundingMonitor {
       const url = `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${this.symbol}`;
       const res = await fetch(url);
       if (!res.ok) return;
-      const data = await res.json();
+      const data: any = await res.json();
 
       if (data && typeof data.lastFundingRate === 'string' && typeof data.nextFundingTime === 'number') {
         const rate = parseFloat(data.lastFundingRate);

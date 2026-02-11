@@ -76,7 +76,7 @@ export class SymbolActor {
       execQuality: {
         quality: 'UNKNOWN',
         metricsPresent: false,
-        freezeActive: true,
+        freezeActive: false,
         lastLatencyMs: null,
         lastSlippageBps: null,
         lastSpreadPct: null,
@@ -149,7 +149,11 @@ export class SymbolActor {
     if (this.state.execQuality.lastSlippageBps === null) {
       dataGaps.push('slippage_missing');
     }
-    const forbiddenEmergency = actions.some((a) => a.type === 'EXIT_MARKET' && a.reason.startsWith('emergency_exit_') && a.reason !== 'emergency_exit_liquidation_risk' && a.reason !== 'emergency_exit_hard_stop');
+    const forbiddenEmergency = actions.some((a) => a.type === 'EXIT_MARKET'
+      && typeof a.reason === 'string'
+      && a.reason.startsWith('emergency_exit_')
+      && a.reason !== 'emergency_exit_liquidation_risk'
+      && a.reason !== 'emergency_exit_hard_stop');
     const invariantViolated = forbiddenEmergency || (this.state.execQuality.quality === 'UNKNOWN' && actions.some((a) => a.reason === 'emergency_exit_exec_quality'));
     const invariantReason = forbiddenEmergency
       ? 'forbidden_emergency_exit_reason'
