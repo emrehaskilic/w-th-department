@@ -153,7 +153,7 @@ export function createOrchestratorFromEnv(): Orchestrator {
   const executionEnabledEnv = String(process.env.EXECUTION_ENABLED || 'false').toLowerCase();
 
   const connector = new ExecutionConnector({
-    enabled: executionEnabledEnv === 'true' || executionEnabledEnv === '1',
+    enabled: executionEnabledEnv === 'true',
     apiKey: process.env.BINANCE_TESTNET_API_KEY,
     apiSecret: process.env.BINANCE_TESTNET_API_SECRET,
     restBaseUrl: process.env.BINANCE_TESTNET_REST_BASE || 'https://testnet.binancefuture.com',

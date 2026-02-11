@@ -5,30 +5,18 @@ export interface ExecutionDecision {
     side: 'BUY' | 'SELL';
     price: number;
     quantity: number;
-    dryRun: boolean;
 }
 
 export class BinanceExecutor {
     private connector: ExecutionConnector;
-    private mode: 'live' | 'dry-run';
 
-    constructor(connector: ExecutionConnector, mode: 'live' | 'dry-run' = 'dry-run') {
+    constructor(connector: ExecutionConnector) {
         this.connector = connector;
-        this.mode = mode;
-    }
-
-    public setMode(mode: 'live' | 'dry-run') {
-        this.mode = mode;
     }
 
     public async execute(decision: ExecutionDecision): Promise<{ ok: boolean; orderId?: string; error?: string }> {
         if (!this.connector.isExecutionEnabled()) {
             return { ok: false, error: 'EXECUTION_DISABLED' };
-        }
-
-        if (this.mode === 'dry-run' || decision.dryRun) {
-            console.log(`[Executor] DRY-RUN: Would place ${decision.side} ${decision.quantity} ${decision.symbol} @ ${decision.price}`);
-            return { ok: true, orderId: 'DRY_RUN_ID' };
         }
 
         try {

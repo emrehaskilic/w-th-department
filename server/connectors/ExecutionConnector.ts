@@ -375,7 +375,7 @@ export class ExecutionConnector {
         ts: Date.now(),
         payload: { why_not_sent: 'disabled' },
       });
-      return { orderId: `dry-${request.clientOrderId}` };
+      throw new Error('Execution disabled');
     }
 
     if (!this.apiKey || !this.apiSecret) {

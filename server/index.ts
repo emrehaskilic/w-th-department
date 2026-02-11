@@ -90,8 +90,9 @@ const GRACE_PERIOD_MS = 5000;
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
-let EXECUTION_MODE = (process.env.EXECUTION_MODE || 'dry-run') as 'live' | 'dry-run';
-const executionSkipLogBySymbol = new Map<string, number>();
+const EXECUTION_ENABLED_ENV = String(process.env.EXECUTION_ENABLED || '').toLowerCase() === 'true';
+let EXECUTION_ENABLED = EXECUTION_ENABLED_ENV;
+const EXECUTION_ENV = 'testnet';
 
 // =============================================================================
 // Logging
@@ -103,6 +104,73 @@ function log(event: string, data: any = {}) {
         event,
         ...data
     }));
+}
+
+type OrderAttemptReason =
+    | 'EXEC_DISABLED'
+    | 'NOT_READY'
+    | 'MISSING_KEYS'
+    | 'KILL_SWITCH'
+    | 'RISK_BLOCK'
+    | 'SIZE_ZERO'
+    | 'SENT'
+    | 'EXCHANGE_ERROR';
+
+function getExecutionGateState() {
+    const status = orchestrator.getExecutionStatus();
+    const connection = status.connection;
+    const hasCredentials = Boolean(connection.hasCredentials);
+    const ready = Boolean(connection.ready);
+    const executionAllowed = EXECUTION_ENABLED && !KILL_SWITCH && hasCredentials && ready;
+    return {
+        executionAllowed,
+        hasCredentials,
+        ready,
+        readyReason: connection.readyReason,
+        connectionState: connection.state,
+    };
+}
+
+function logOrderAttemptAudit(data: {
+    reasonCode: OrderAttemptReason;
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    price: number;
+    qty: number;
+    notional: number;
+    leverage: number;
+    marginBudget: number;
+    bufferBps: number;
+    error?: string;
+    readyReason?: string | null;
+}) {
+    const {
+        reasonCode,
+        symbol,
+        side,
+        price,
+        qty,
+        notional,
+        leverage,
+        marginBudget,
+        bufferBps,
+        error,
+        readyReason,
+    } = data;
+
+    log('ORDER_ATTEMPT_AUDIT', {
+        reason_code: reasonCode,
+        symbol,
+        side,
+        price,
+        qty,
+        notional,
+        leverage,
+        marginBudget,
+        bufferBps,
+        error,
+        readyReason,
+    });
 }
 
 // =============================================================================
@@ -183,11 +251,21 @@ const backfillInFlight = new Set<string>();
 const backfillLastAttemptMs = new Map<string, number>();
 const BACKFILL_RETRY_INTERVAL_MS = 30_000;
 const orchestrator = createOrchestratorFromEnv();
-
-function isExecutionEnabled(): boolean {
-    return orchestrator.getConnector().isExecutionEnabled();
+if (typeof process.env.EXECUTION_MODE !== 'undefined') {
+    log('CONFIG_WARNING', { message: 'EXECUTION_MODE is deprecated and ignored' });
 }
 
+const hasEnvApiKey = Boolean(process.env.BINANCE_TESTNET_API_KEY);
+const hasEnvApiSecret = Boolean(process.env.BINANCE_TESTNET_API_SECRET);
+const initialGate = getExecutionGateState();
+log('EXECUTION_CONFIG', {
+    execEnabled: EXECUTION_ENABLED,
+    killSwitch: KILL_SWITCH,
+    env: EXECUTION_ENV,
+    hasApiKey: hasEnvApiKey,
+    hasApiSecret: hasEnvApiSecret,
+    executionAllowed: initialGate.executionAllowed,
+});
 // Cached Exchange Info
 let exchangeInfoCache: { data: any; timestamp: number } | null = null;
 const EXCHANGE_INFO_TTL_MS = 1000 * 60 * 60; // 1 hr
@@ -318,9 +396,7 @@ const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s,
 const getRisk = (s: string) => { if (!riskMap.has(s)) riskMap.set(s, new RiskManager()); return riskMap.get(s)!; };
 const getExecutor = (s: string) => {
     if (!executorMap.has(s)) {
-        executorMap.set(s, new BinanceExecutor(orchestrator.getConnector() as any, EXECUTION_MODE));
-    } else {
-        executorMap.get(s)!.setMode(EXECUTION_MODE);
+        executorMap.set(s, new BinanceExecutor(orchestrator.getConnector() as any));
     }
     return executorMap.get(s)!;
 };
@@ -794,18 +870,7 @@ async function processSymbolEvent(s: string, d: any) {
         });
 
         // [PHASE 3] Execution Check
-        if (signal.signal && !KILL_SWITCH) {
-            if (!isExecutionEnabled()) {
-                const nowMs = Date.now();
-                const lastLogAt = executionSkipLogBySymbol.get(s) || 0;
-                if (nowMs - lastLogAt > 30000) {
-                    executionSkipLogBySymbol.set(s, nowMs);
-                    log('EXECUTION_SKIPPED', { symbol: s, signal: signal.signal, reason: 'EXECUTION_DISABLED' });
-                }
-                broadcastMetrics(s, ob, tas, cvd, absVal, leg, t, signal);
-                return;
-            }
-
+        if (signal.signal) {
             const risk = getRisk(s);
             const executor = getExecutor(s);
             const side: 'BUY' | 'SELL' = (signal.signal === 'BREAKOUT_LONG' || signal.signal === 'SWEEP_FADE_LONG') ? 'BUY' : 'SELL';
@@ -825,22 +890,49 @@ async function processSymbolEvent(s: string, d: any) {
             const sizedQty = notionalUsdt > 0 && p > 0
                 ? Number((notionalUsdt / p).toFixed(6))
                 : q;
+            const bufferBps = 0;
 
-            if (!(sizedQty > 0)) {
-                log('EXECUTION_VETO', { symbol: s, signal: signal.signal, reason: 'INVALID_SIZED_QTY' });
+            const auditBase = {
+                symbol: s,
+                side,
+                price: p,
+                qty: sizedQty,
+                notional: notionalUsdt,
+                leverage: configuredLeverage,
+                marginBudget: pairMarginUsdt,
+                bufferBps,
+            };
+
+            const gate = getExecutionGateState();
+            if (KILL_SWITCH) {
+                logOrderAttemptAudit({ ...auditBase, reasonCode: 'KILL_SWITCH' });
+            } else if (!EXECUTION_ENABLED) {
+                logOrderAttemptAudit({ ...auditBase, reasonCode: 'EXEC_DISABLED' });
+            } else if (!gate.hasCredentials) {
+                logOrderAttemptAudit({ ...auditBase, reasonCode: 'MISSING_KEYS' });
+            } else if (!gate.ready) {
+                logOrderAttemptAudit({ ...auditBase, reasonCode: 'NOT_READY', readyReason: gate.readyReason });
+            } else if (!(sizedQty > 0)) {
+                logOrderAttemptAudit({ ...auditBase, reasonCode: 'SIZE_ZERO' });
             } else {
                 const riskCheck = risk.check(s, side, p, sizedQty, {
                     maxPositionNotionalUsdt: notionalUsdt > 0 ? notionalUsdt * 1.02 : undefined,
                 });
-                if (riskCheck.ok) {
+                if (!riskCheck.ok) {
+                    logOrderAttemptAudit({ ...auditBase, reasonCode: 'RISK_BLOCK', error: riskCheck.reason });
+                } else {
                     risk.recordTrade(s);
                     executor.execute({
                         symbol: s,
                         side,
                         price: p,
                         quantity: sizedQty,
-                        dryRun: EXECUTION_MODE === 'dry-run'
                     }).then(res => {
+                        logOrderAttemptAudit({
+                            ...auditBase,
+                            reasonCode: res.ok ? 'SENT' : 'EXCHANGE_ERROR',
+                            error: res.ok ? undefined : res.error,
+                        });
                         log('EXECUTION_RESULT', {
                             symbol: s,
                             signal: signal.signal,
@@ -850,9 +942,24 @@ async function processSymbolEvent(s: string, d: any) {
                             quantity: sizedQty,
                             ...res
                         });
+                    }).catch((e: any) => {
+                        const errorMsg = e?.message || 'execution_failed';
+                        logOrderAttemptAudit({
+                            ...auditBase,
+                            reasonCode: 'EXCHANGE_ERROR',
+                            error: errorMsg,
+                        });
+                        log('EXECUTION_RESULT', {
+                            symbol: s,
+                            signal: signal.signal,
+                            leverage: configuredLeverage,
+                            pairMarginUsdt,
+                            notionalUsdt,
+                            quantity: sizedQty,
+                            ok: false,
+                            error: errorMsg,
+                        });
                     });
-                } else {
-                    log('RISK_VETO', { symbol: s, signal: signal.signal, reason: riskCheck.reason });
                 }
             }
         }
@@ -1073,8 +1180,7 @@ app.use(cors(corsOptions));
 app.get('/api/health', (req, res) => {
     res.json({
         ok: true,
-        executionEnabled: isExecutionEnabled(),
-        executionMode: EXECUTION_MODE,
+        executionEnabled: EXECUTION_ENABLED,
         killSwitch: KILL_SWITCH,
         activeSymbols: Array.from(activeSymbols),
         wsState
@@ -1211,14 +1317,9 @@ app.post('/api/execution/disconnect', async (req, res) => {
 
 app.post('/api/execution/enabled', async (req, res) => {
     const enabled = Boolean(req.body?.enabled);
-    await orchestrator.setExecutionEnabled(enabled);
-    res.json({ ok: true, status: orchestrator.getExecutionStatus(), executionEnabled: isExecutionEnabled(), executionMode: EXECUTION_MODE });
-});
-
-app.post('/api/execution/mode', (req, res) => {
-    const modeRaw = String(req.body?.mode || '').toLowerCase();
-    EXECUTION_MODE = modeRaw === 'live' ? 'live' : 'dry-run';
-    res.json({ ok: true, executionMode: EXECUTION_MODE });
+    EXECUTION_ENABLED = EXECUTION_ENABLED_ENV && enabled;
+    await orchestrator.setExecutionEnabled(EXECUTION_ENABLED);
+    res.json({ ok: true, status: orchestrator.getExecutionStatus(), executionEnabled: EXECUTION_ENABLED });
 });
 
 app.post('/api/execution/symbol', async (req, res) => {
