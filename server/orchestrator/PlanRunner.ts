@@ -303,7 +303,7 @@ export class PlanRunner {
     trendScore: number,
     gatePassed: boolean
   ): boolean {
-    const key = `${this.ctx.planState}|${this.ctx.planId}|${this.ctx.side}|${Math.round(this.ctx.budgetUsdt)}|${position?.qty || 0}|${trendState}|${trendScore.toFixed(3)}|${gatePassed}`;
+    const key = `${this.ctx.planState}|${this.ctx.planId}|${this.ctx.side}|${Math.round(this.ctx.budgetUsdt)}|${position?.qty || 0}|${trendState}|${trendScore.toFixed(2)}|${gatePassed}`;
     if (this.ctx.lastPlanKey !== key) {
       this.ctx.lastPlanKey = key;
       return true;
