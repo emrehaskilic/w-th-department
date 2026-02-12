@@ -18,6 +18,7 @@ import * as FreezePolicyTests from './FreezeEmergencyPolicy.test';
 import * as ProfitLockTests from './ProfitLock.test';
 import * as SizingRampTests from './SizingRamp.test';
 import * as SizingCalculationTests from './SizingCalculation.test';
+import * as OrderPlanTests from './OrderPlan.test';
 
 // Minimal test harness: runs each runTests() and prints summary
 const testSuites: { name: string; fn: () => void }[] = [
@@ -36,6 +37,7 @@ const testSuites: { name: string; fn: () => void }[] = [
   { name: 'ProfitLock', fn: ProfitLockTests.runTests },
   { name: 'SizingRamp', fn: SizingRampTests.runTests },
   { name: 'SizingCalculation', fn: SizingCalculationTests.runTests },
+  { name: 'OrderPlan', fn: OrderPlanTests.runTests },
 ];
 
 let total = 0;

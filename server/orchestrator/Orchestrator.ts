@@ -7,6 +7,8 @@ import { SymbolActor } from './Actor';
 import { DecisionEngine } from './Decision';
 import { runGate } from './Gate';
 import { OrchestratorLogger } from './Logger';
+import { PlannedOrder } from './OrderPlan';
+import { PlanRunner, PlanTickResult } from './PlanRunner';
 import { SizingRamp } from './SizingRamp';
 import {
   DecisionAction,
@@ -37,6 +39,7 @@ export class Orchestrator {
   private readonly actors = new Map<string, SymbolActor>();
   private readonly ramps = new Map<string, SizingRamp>();
   private readonly riskManagers = new Map<string, RiskManager>();
+  private readonly planRunners = new Map<string, PlanRunner>();
   private readonly expectedOrderMeta = new Map<string, ExpectedOrderMeta>();
   private readonly decisionLedger: any[] = [];
   private readonly stateSnapshots = new Map<string, SymbolState>();
@@ -146,6 +149,7 @@ export class Orchestrator {
     this.actors.clear();
     this.ramps.clear();
     this.riskManagers.clear();
+    this.planRunners.clear();
   }
 
   getDecisionLedger() {
@@ -279,6 +283,7 @@ export class Orchestrator {
         this.ramps.delete(symbol);
         this.actors.delete(symbol);
         this.riskManagers.delete(symbol);
+        this.planRunners.delete(symbol);
       }
     }
   }
@@ -341,9 +346,12 @@ export class Orchestrator {
       profitLockBufferBps: this.config.profitLockBufferBps,
     });
 
+    const planRunner = this.ensurePlanRunner(normalized);
+
     const actor = new SymbolActor({
       symbol: normalized,
       decisionEngine,
+      planRunner,
       onActions: async (actions) => {
         await this.handleActions(normalized, actions);
       },
@@ -356,11 +364,27 @@ export class Orchestrator {
         this.stateSnapshots.set(normalized, state);
         this.logger.logExecution(event.event_time_ms, { event, state });
       },
+      onPlanLogged: (record) => {
+        this.decisionLedger.push(record);
+        const state = this.actors.get(normalized)?.state;
+        if (state) {
+          this.stateSnapshots.set(normalized, state);
+        }
+        this.logger.logDecision(record.ts || Date.now(), record);
+      },
+      onPlanActions: async (result) => {
+        await this.handlePlanActions(normalized, result);
+      },
+      onPlanEvent: (event) => {
+        this.log(event.type, event.detail || {});
+      },
+      planOrderPrefix: this.config.plan.orderPrefix,
       getExpectedOrderMeta: (orderId) => this.expectedOrderMeta.get(orderId) || null,
       getStartingMarginUsdt: () => this.getStartingMarginUsdt(normalized),
       getCurrentMarginBudgetUsdt: () => this.getCurrentMarginBudgetUsdt(normalized),
       getRampMult: () => this.getRampMult(normalized),
       getEffectiveLeverage: () => this.getEffectiveLeverage(),
+      getExecutionReady: () => this.getExecutionGateState().ready,
       onPositionClosed: (realizedPnl) => this.onPositionClosed(normalized, realizedPnl),
       markAddUsed: () => {},
       cooldownConfig: this.config.cooldown,
@@ -368,6 +392,17 @@ export class Orchestrator {
 
     this.actors.set(normalized, actor);
     return actor;
+  }
+
+  private ensurePlanRunner(symbol: string): PlanRunner {
+    const normalized = symbol.toUpperCase();
+    const existing = this.planRunners.get(normalized);
+    if (existing) {
+      return existing;
+    }
+    const runner = new PlanRunner(this.config.plan);
+    this.planRunners.set(normalized, runner);
+    return runner;
   }
 
   private ensureRamp(symbol: string): SizingRamp {
@@ -477,6 +512,213 @@ export class Orchestrator {
       error: data.error,
       readyReason: data.readyReason,
     });
+  }
+
+  private async handlePlanActions(symbol: string, result: PlanTickResult) {
+    if (this.replayMode) {
+      return;
+    }
+
+    const actions = result.reconcile.actions;
+    const ordered = result.planState === 'EXITING'
+      ? [...actions.filter((a) => a.kind === 'CANCEL'), ...actions.filter((a) => a.kind !== 'CANCEL')]
+      : actions;
+
+    if (result.planState === 'EXITING') {
+      for (const action of ordered) {
+        if (action.kind === 'CANCEL') {
+          await this.cancelPlannedOrder(symbol, action.existing);
+        }
+      }
+      for (const order of result.immediateOrders) {
+        await this.executePlannedOrder(order);
+      }
+    } else {
+      for (const order of result.immediateOrders) {
+        await this.executePlannedOrder(order);
+      }
+    }
+
+    for (const action of ordered) {
+      if (action.kind === 'CANCEL') {
+        if (result.planState !== 'EXITING') {
+          await this.cancelPlannedOrder(symbol, action.existing);
+        }
+        continue;
+      }
+      if (action.kind === 'REPLACE') {
+        const canceled = await this.cancelPlannedOrder(symbol, action.existing);
+        if (!canceled) {
+          continue;
+        }
+        await this.executePlannedOrder(action.order);
+        continue;
+      }
+      if (action.kind === 'PLACE') {
+        await this.executePlannedOrder(action.order);
+      }
+    }
+  }
+
+  private async executePlannedOrder(order: PlannedOrder) {
+    const side = order.side;
+    const leverage = this.getEffectiveLeverage();
+    const marginBudget = this.getCurrentMarginBudgetUsdt(order.symbol);
+    const bufferBps = 0;
+
+    let price = 0;
+    if (order.type === 'LIMIT') {
+      price = typeof order.price === 'number' && Number.isFinite(order.price) ? order.price : 0;
+    } else {
+      const expected = this.connector.expectedPrice(order.symbol, side, 'MARKET');
+      price = typeof expected === 'number' && Number.isFinite(expected) ? expected : (order.price || 0);
+    }
+
+    const auditBase = {
+      symbol: order.symbol,
+      side,
+      price,
+      qty: order.qty,
+      notional: price > 0 ? price * order.qty : 0,
+      leverage,
+      marginBudget,
+      bufferBps,
+    };
+
+    if (this.killSwitch) {
+      this.logOrderAttemptAudit({ ...auditBase, reasonCode: 'KILL_SWITCH' });
+      return;
+    }
+    if (!this.connector.isExecutionEnabled()) {
+      this.logOrderAttemptAudit({ ...auditBase, reasonCode: 'EXEC_DISABLED' });
+      return;
+    }
+
+    const gate = this.getExecutionGateState();
+    if (!gate.hasCredentials) {
+      this.logOrderAttemptAudit({ ...auditBase, reasonCode: 'MISSING_KEYS' });
+      return;
+    }
+    if (!gate.ready) {
+      this.logOrderAttemptAudit({ ...auditBase, reasonCode: 'NOT_READY', readyReason: gate.readyReason });
+      return;
+    }
+
+    if (!(order.qty > 0)) {
+      this.logOrderAttemptAudit({ ...auditBase, reasonCode: 'SIZE_ZERO' });
+      return;
+    }
+
+    if (order.type === 'LIMIT' && !(price > 0)) {
+      this.logOrderAttemptAudit({ ...auditBase, reasonCode: 'RISK_BLOCK', error: 'missing_limit_price' });
+      return;
+    }
+
+    let sizingQty = order.qty;
+    let sizingNotional = auditBase.notional;
+    let sizingPrice = price;
+    try {
+      const sizing = await this.connector.previewOrderSizing(order.symbol, side, order.qty, price > 0 ? price : null);
+      sizingQty = sizing.qtyRounded;
+      sizingNotional = sizing.notionalUsdt;
+      if (!(sizingQty > 0)) {
+        this.logOrderAttemptAudit({ ...auditBase, reasonCode: 'SIZE_ZERO' });
+        return;
+      }
+      if (!order.reduceOnly && !sizing.minNotionalOk) {
+        this.logOrderAttemptAudit({
+          ...auditBase,
+          qty: sizingQty,
+          notional: sizingNotional,
+          reasonCode: 'RISK_BLOCK',
+          error: 'min_notional',
+        });
+        return;
+      }
+      if (!(price > 0)) {
+        sizingPrice = sizing.markPrice;
+      }
+    } catch (e: any) {
+      this.logOrderAttemptAudit({
+        ...auditBase,
+        reasonCode: 'RISK_BLOCK',
+        error: e?.message || 'sizing_failed',
+      });
+      return;
+    }
+
+    if (!order.reduceOnly) {
+      const risk = this.getRiskManager(order.symbol);
+      const riskCheck = risk.check(order.symbol, side, sizingPrice, sizingQty, {
+        maxPositionNotionalUsdt: marginBudget > 0 ? marginBudget * leverage * 1.02 : undefined,
+      });
+      if (!riskCheck.ok) {
+        this.logOrderAttemptAudit({
+          ...auditBase,
+          qty: sizingQty,
+          notional: sizingNotional,
+          reasonCode: 'RISK_BLOCK',
+          error: riskCheck.reason || 'risk_blocked',
+        });
+        return;
+      }
+    }
+
+    try {
+      const res = await this.connector.placeOrder({
+        symbol: order.symbol,
+        side,
+        type: order.type,
+        quantity: sizingQty,
+        price: order.type === 'LIMIT' ? sizingPrice : undefined,
+        reduceOnly: order.reduceOnly,
+        clientOrderId: order.clientOrderId,
+      });
+      this.logOrderAttemptAudit({
+        ...auditBase,
+        qty: sizingQty,
+        notional: sizingNotional,
+        reasonCode: 'SENT',
+      });
+      if (res.orderId) {
+        const tag = order.reduceOnly || ['TP', 'STOP', 'FLATTEN', 'FLIP'].includes(order.role)
+          ? 'exit'
+          : order.role === 'SCALE_IN'
+            ? 'add'
+            : 'entry';
+        this.expectedOrderMeta.set(res.orderId, {
+          expectedPrice: sizingPrice || null,
+          sentAtMs: Date.now(),
+          tag,
+        });
+      }
+      if (!order.reduceOnly) {
+        this.getRiskManager(order.symbol).recordTrade(order.symbol);
+      }
+      if (order.role === 'TP') {
+        this.log('TP_PLACED', { symbol: order.symbol, price: sizingPrice, qty: sizingQty, clientOrderId: order.clientOrderId });
+      }
+    } catch (e: any) {
+      this.logOrderAttemptAudit({
+        ...auditBase,
+        reasonCode: 'EXCHANGE_ERROR',
+        error: e?.message || 'execution_failed',
+      });
+    }
+  }
+
+  private async cancelPlannedOrder(symbol: string, order: { orderId?: string; clientOrderId?: string }): Promise<boolean> {
+    try {
+      await this.connector.cancelOrder({
+        symbol,
+        orderId: order.orderId,
+        clientOrderId: order.clientOrderId,
+      });
+      return true;
+    } catch (e: any) {
+      this.log('EXECUTION_CANCEL_ERROR', { symbol, error: e?.message || 'cancel_failed' });
+      return false;
+    }
   }
 
   private async handleActions(symbol: string, actions: DecisionAction[]) {
@@ -647,6 +889,13 @@ export function createOrchestratorFromEnv(): Orchestrator {
     const normalized = value.trim().replace(/^['"]|['"]$/g, '').toLowerCase();
     return normalized === 'true';
   };
+  const parseNumberList = (value: string | undefined): number[] => {
+    if (!value) return [];
+    return value
+      .split(',')
+      .map((v) => Number(v.trim()))
+      .filter((v) => Number.isFinite(v));
+  };
 
   const executionEnabledEnv = parseEnvFlag(process.env.EXECUTION_ENABLED);
   const enableGateV2 = parseEnvFlag(process.env.ENABLE_GATE_V2);
@@ -673,6 +922,75 @@ export function createOrchestratorFromEnv(): Orchestrator {
     dualSidePosition: String(process.env.POSITION_MODE || 'ONE-WAY').toUpperCase() === 'HEDGE',
   });
 
+  const planConfig = {
+    planEpochMs: Number(process.env.PLAN_EPOCH_MS || 60_000),
+    orderPrefix: String(process.env.PLAN_ORDER_PREFIX || 'p'),
+    planRebuildCooldownMs: Number(process.env.PLAN_REBUILD_COOLDOWN_MS || 2000),
+    orderPriceTolerancePct: Number(process.env.PLAN_PRICE_TOL_PCT || 0.05),
+    orderQtyTolerancePct: Number(process.env.PLAN_QTY_TOL_PCT || 1),
+    replaceThrottlePerSecond: Number(process.env.PLAN_REPLACE_THROTTLE_PER_SEC || 5),
+    cancelStalePlanOrders: parseEnvFlag(process.env.PLAN_CANCEL_STALE ?? 'true'),
+    boot: {
+      probeMarketPct: Number(process.env.BOOT_PROBE_MARKET_PCT || 0.15),
+      waitReadyMs: Number(process.env.BOOT_WAIT_READY_MS || 1500),
+      maxSpreadPct: Number(process.env.BOOT_MAX_SPREAD_PCT || 0.12),
+      minObiDeep: Number(process.env.BOOT_MIN_OBI_DEEP || 0.03),
+      minDeltaZ: Number(process.env.BOOT_MIN_DELTA_Z || 0.15),
+      allowMarket: parseEnvFlag(process.env.BOOT_ALLOW_MARKET ?? 'true'),
+      retryMs: Number(process.env.BOOT_RETRY_MS || 5000),
+    },
+    trend: {
+      upEnter: Number(process.env.TREND_UP_ENTER || 0.45),
+      upExit: Number(process.env.TREND_UP_EXIT || 0.15),
+      downEnter: Number(process.env.TREND_DOWN_ENTER || -0.45),
+      downExit: Number(process.env.TREND_DOWN_EXIT || -0.15),
+      confirmTicks: Number(process.env.TREND_CONFIRM_TICKS || 3),
+      reversalConfirmTicks: Number(process.env.TREND_REVERSAL_CONFIRM_TICKS || 4),
+      obiNorm: Number(process.env.TREND_OBI_NORM || 0.3),
+      deltaNorm: Number(process.env.TREND_DELTA_NORM || 1.0),
+      cvdNorm: Number(process.env.TREND_CVD_NORM || 0.8),
+      scoreClamp: Number(process.env.TREND_SCORE_CLAMP || 1.0),
+    },
+    scaleIn: {
+      levels: Number(process.env.SCALE_IN_LEVELS || 3),
+      stepPct: Number(process.env.SCALE_IN_STEP_PCT || 0.15),
+      maxAdds: Number(process.env.MAX_ADDS || 3),
+      addOnlyIfTrendConfirmed: parseEnvFlag(process.env.ADD_ONLY_IF_TREND_CONFIRMED ?? 'true'),
+      addMinUpnlUsdt: Number(process.env.ADD_MIN_UPNL_USDT || 0),
+      addMinUpnlR: Number(process.env.ADD_MIN_UPNL_R || 0),
+    },
+    tp: {
+      levels: Number(process.env.TP_LEVELS || 3),
+      stepPcts: parseNumberList(process.env.TP_STEP_PCTS || '0.2,0.45,0.8'),
+      distribution: parseNumberList(process.env.TP_DISTRIBUTION || '40,35,25'),
+      reduceOnly: parseEnvFlag(process.env.TP_REDUCE_ONLY ?? 'true'),
+    },
+    profitLock: {
+      lockTriggerUsdt: Number(process.env.LOCK_TRIGGER_USDT || 0),
+      lockTriggerR: Number(process.env.LOCK_TRIGGER_R || 0.25),
+      maxDdFromPeakUsdt: Number(process.env.MAX_DD_FROM_PEAK_USDT || 0),
+      maxDdFromPeakR: Number(process.env.MAX_DD_FROM_PEAK_R || 0.25),
+    },
+    reversalExitMode: String(process.env.REVERSAL_EXIT_MODE || 'MARKET').toUpperCase() === 'LIMIT' ? 'LIMIT' : 'MARKET',
+    exitLimitBufferBps: Number(process.env.EXIT_LIMIT_BUFFER_BPS || 5),
+    exitRetryMs: Number(process.env.EXIT_RETRY_MS || 3000),
+    allowFlip: parseEnvFlag(process.env.ALLOW_FLIP ?? 'false'),
+    initialMarginUsdt: Number(process.env.INITIAL_MARGIN_USDT || process.env.STARTING_MARGIN_USDT || 0),
+    maxMarginUsdt: Number(process.env.MAX_MARGIN_USDT || 0),
+    stepUp: {
+      mode: String(process.env.RISK_STEP_UP_MODE || 'UPNL').toUpperCase() === 'R_MULTIPLE'
+        ? 'R_MULTIPLE'
+        : String(process.env.RISK_STEP_UP_MODE || 'UPNL').toUpperCase() === 'TREND_SCORE'
+          ? 'TREND_SCORE'
+          : 'UPNL',
+      stepPct: Number(process.env.STEP_UP_PCT || 0.2),
+      triggerUsdt: Number(process.env.STEP_UP_TRIGGER_USDT || 0),
+      triggerR: Number(process.env.STEP_UP_TRIGGER_R || 0.5),
+      minTrendScore: Number(process.env.STEP_UP_MIN_TREND_SCORE || 0.4),
+      cooldownMs: Number(process.env.STEP_UP_COOLDOWN_MS || 15000),
+    },
+  };
+
   return new Orchestrator(connector, {
     maxLeverage: Number(process.env.MAX_LEVERAGE || 125),
     loggerQueueLimit: Number(process.env.LOGGER_QUEUE_LIMIT || 10000),
@@ -691,5 +1009,6 @@ export function createOrchestratorFromEnv(): Orchestrator {
     liquidationEmergencyMarginRatio: Number(process.env.LIQUIDATION_EMERGENCY_MARGIN_RATIO || 0.3),
     takerFeeBps: Number(process.env.TAKER_FEE_BPS || 4),
     profitLockBufferBps: Number(process.env.PROFIT_LOCK_BUFFER_BPS || 2),
+    plan: planConfig,
   });
 }

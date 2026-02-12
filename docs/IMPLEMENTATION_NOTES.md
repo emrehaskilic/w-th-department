@@ -38,3 +38,23 @@
 - **Strategy loop:** `server/index.ts` (trade/depth events → `StrategyEngine.compute` → `broadcastMetrics`) and `server/strategy/StrategyEngine.ts`.
 - **Risk/cooldown:** `server/risk/RiskManager.ts` (cooldown/notional), `server/orchestrator/SizingRamp.ts` (budget ramp).
 - **Telemetry/logs:** `server/orchestrator/Logger.ts` (metrics/decision/execution JSONL), `server/orchestrator/Actor.ts` (decision/execution logging), `server/orchestrator/Orchestrator.ts` (ORDER_ATTEMPT_AUDIT stdout).
+
+## Order Plan Architecture (Boot Probe + Ladder)
+- **OrderPlan/Tags:** `server/orchestrator/OrderPlan.ts` (plan id, roles, clientOrderId tags).
+- **PlanRunner:** `server/orchestrator/PlanRunner.ts` (trend state, boot probe, scale-in ladder, TP ladder, profit lock, reversal).
+- **Reconciler:** `server/orchestrator/Reconciler.ts` (idempotent reconcile + churn guard).
+- **Integration:** `server/orchestrator/Actor.ts` (plan tick + telemetry), `server/orchestrator/Orchestrator.ts` (plan actions → place/cancel).
+
+## Config (Env)
+- **Plan / Reconcile:** `PLAN_EPOCH_MS`, `PLAN_ORDER_PREFIX`, `PLAN_REBUILD_COOLDOWN_MS`, `PLAN_PRICE_TOL_PCT`, `PLAN_QTY_TOL_PCT`, `PLAN_REPLACE_THROTTLE_PER_SEC`, `PLAN_CANCEL_STALE`.
+- **Boot Probe:** `BOOT_PROBE_MARKET_PCT`, `BOOT_WAIT_READY_MS`, `BOOT_MAX_SPREAD_PCT`, `BOOT_MIN_OBI_DEEP`, `BOOT_MIN_DELTA_Z`, `BOOT_ALLOW_MARKET`, `BOOT_RETRY_MS`.
+- **Trend State:** `TREND_UP_ENTER`, `TREND_UP_EXIT`, `TREND_DOWN_ENTER`, `TREND_DOWN_EXIT`, `TREND_CONFIRM_TICKS`, `TREND_REVERSAL_CONFIRM_TICKS`, `TREND_OBI_NORM`, `TREND_DELTA_NORM`, `TREND_CVD_NORM`, `TREND_SCORE_CLAMP`.
+- **Scale-In:** `SCALE_IN_LEVELS`, `SCALE_IN_STEP_PCT`, `MAX_ADDS`, `ADD_ONLY_IF_TREND_CONFIRMED`, `ADD_MIN_UPNL_USDT`, `ADD_MIN_UPNL_R`.
+- **TP Ladder:** `TP_LEVELS`, `TP_STEP_PCTS` (comma), `TP_DISTRIBUTION` (comma), `TP_REDUCE_ONLY`.
+- **Profit Lock:** `LOCK_TRIGGER_USDT`, `LOCK_TRIGGER_R`, `MAX_DD_FROM_PEAK_USDT`, `MAX_DD_FROM_PEAK_R`.
+- **Reversal:** `REVERSAL_EXIT_MODE` (`MARKET|LIMIT`), `EXIT_LIMIT_BUFFER_BPS`, `EXIT_RETRY_MS`, `ALLOW_FLIP`.
+- **Sizing/Step-Up:** `INITIAL_MARGIN_USDT`, `MAX_MARGIN_USDT`, `RISK_STEP_UP_MODE`, `STEP_UP_PCT`, `STEP_UP_TRIGGER_USDT`, `STEP_UP_TRIGGER_R`, `STEP_UP_MIN_TREND_SCORE`, `STEP_UP_COOLDOWN_MS`.
+
+## How to Run
+- `npm run dev:server` for backend, `npm run dev` for UI.
+- Tests: `npm test` (runs server tests).

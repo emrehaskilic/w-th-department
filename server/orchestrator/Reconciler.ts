@@ -125,13 +125,9 @@ function throttleActions(actions: PlanAction[], maxPerSecond: number): PlanActio
   if (!Number.isFinite(maxPerSecond) || maxPerSecond <= 0) {
     return actions;
   }
-  if (actions.length <= maxPerSecond) {
-    return actions;
-  }
-  // Prioritize cancels, then replaces, then places.
   const cancels = actions.filter((a) => a.kind === 'CANCEL');
   const replaces = actions.filter((a) => a.kind === 'REPLACE');
   const places = actions.filter((a) => a.kind === 'PLACE');
-  const ordered = [...cancels, ...replaces, ...places];
-  return ordered.slice(0, maxPerSecond);
+  const limited = [...replaces, ...places].slice(0, maxPerSecond);
+  return [...cancels, ...limited];
 }

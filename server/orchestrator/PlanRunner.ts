@@ -3,7 +3,6 @@ import { OrderPlanConfig, OrchestratorMetricsInput, SymbolState } from './types'
 import {
   OrderRole,
   OrderTag,
-  PlanAction,
   PlanState,
   PlannedOrder,
   PlanReconcileResult,
@@ -35,6 +34,7 @@ export interface PlanTickResult {
   trendScore: number;
   confirmCount: number;
   desiredOrders: PlannedOrder[];
+  immediateOrders: PlannedOrder[];
   reconcile: PlanReconcileResult;
   summary: PlanTickSummary;
   events: Array<{ type: string; detail?: Record<string, any> }>;
@@ -89,7 +89,11 @@ export class PlanRunner {
 
     this.updateReadySince(input.executionReady, nowMs);
 
+    const prevState = this.ctx.planState;
     this.updatePlanState(position, openOrders.length === 0);
+    if (prevState !== this.ctx.planState && this.ctx.planState === 'ACTIVE') {
+      events.push({ type: 'PLAN_ACTIVATED', detail: { planId: this.ctx.planId } });
+    }
 
     const budgetBase = this.resolveInitialBudget(input);
     if (this.ctx.planId === null && this.ctx.planState === 'FLATTENED') {
@@ -124,6 +128,8 @@ export class PlanRunner {
       this.ctx.lastPlanKey = null;
       events.push({ type: 'FLATTENED' });
     }
+
+    const immediateOrders = this.buildImmediateOrders(input, trendState, trendConfirmed, events);
 
     const shouldRebuild = this.shouldRebuildPlan(nowMs, position, trendState, trendScore, gatePassed);
     const desiredOrders = shouldRebuild
@@ -160,6 +166,7 @@ export class PlanRunner {
       trendScore,
       confirmCount,
       desiredOrders,
+      immediateOrders,
       reconcile,
       summary,
       events,
@@ -321,6 +328,9 @@ export class PlanRunner {
     }
 
     const upnl = input.state.position.unrealizedPnlPct;
+    if (upnl <= 0) {
+      return;
+    }
     const base = this.resolveInitialBudget(input);
     const rMultiple = base > 0 ? upnl / base : 0;
     const trendOk = Math.abs(trendScore) >= this.config.stepUp.minTrendScore;
@@ -391,6 +401,69 @@ export class PlanRunner {
     return null;
   }
 
+  private buildImmediateOrders(
+    input: PlanTickInput,
+    trendState: TrendState,
+    trendConfirmed: boolean,
+    events: Array<{ type: string; detail?: Record<string, any> }>
+  ): PlannedOrder[] {
+    if (!this.ctx.planId || !this.ctx.side) {
+      return [];
+    }
+
+    const immediate: PlannedOrder[] = [];
+    const symbol = input.symbol;
+    const position = input.state.position;
+
+    if (this.ctx.planState === 'BUILDING' || this.ctx.planState === 'BOOT') {
+      const bootGateOk = this.bootGateOk(input.metrics);
+      if (this.config.boot.allowMarket && bootGateOk) {
+        const shouldAttempt = this.shouldAttemptBoot(input.nowMs);
+        if (shouldAttempt) {
+          const price = this.resolveMarketPrice(input.metrics, this.ctx.side);
+          const qty = this.qtyFromBudget(this.ctx.budgetUsdt * this.config.boot.probeMarketPct, price, input.leverage);
+          if (qty > 0 && price > 0) {
+            immediate.push(this.makeOrder({
+              symbol,
+              side: this.ctx.side,
+              type: 'MARKET',
+              role: 'BOOT_PROBE',
+              levelIndex: 0,
+              price,
+              qty,
+              reduceOnly: false,
+            }));
+            events.push({ type: 'BOOT_PROBE_ENTRY', detail: { side: this.ctx.side, qty } });
+            this.ctx.bootAttemptAtMs = input.nowMs;
+          }
+        }
+      }
+    }
+
+    if (this.ctx.planState === 'EXITING' && position && this.config.reversalExitMode === 'MARKET') {
+      const nowMs = input.nowMs;
+      if (!this.ctx.exitAttemptAtMs || nowMs - this.ctx.exitAttemptAtMs >= this.config.exitRetryMs) {
+        const side: Side = position.side === 'LONG' ? 'SELL' : 'BUY';
+        const price = this.resolveMarketPrice(input.metrics, side);
+        if (price > 0) {
+          immediate.push(this.makeOrder({
+            symbol,
+            side,
+            type: 'MARKET',
+            role: 'FLATTEN',
+            levelIndex: 0,
+            price,
+            qty: position.qty,
+            reduceOnly: true,
+          }));
+          this.ctx.exitAttemptAtMs = nowMs;
+        }
+      }
+    }
+
+    return immediate;
+  }
+
   private buildDesiredOrders(
     input: PlanTickInput,
     trendState: TrendState,
@@ -408,45 +481,22 @@ export class PlanRunner {
     const leverage = input.leverage;
     const midPrice = this.resolveMidPrice(input.metrics);
 
-    if (this.ctx.planState === 'BUILDING' || this.ctx.planState === 'BOOT') {
-      const bootGateOk = this.bootGateOk(input.metrics);
-      if (this.config.boot.allowMarket && bootGateOk) {
-        const shouldAttempt = this.shouldAttemptBoot(input.nowMs);
-        if (shouldAttempt) {
-          const price = this.resolveMarketPrice(input.metrics, this.ctx.side);
-          const qty = this.qtyFromBudget(this.ctx.budgetUsdt * this.config.boot.probeMarketPct, price, leverage);
-          if (qty > 0 && price > 0) {
-            desired.push(this.makeOrder({
-              symbol,
-              side: this.ctx.side,
-              type: 'MARKET',
-              role: 'BOOT_PROBE',
-              levelIndex: 0,
-              price,
-              qty,
-              reduceOnly: false,
-            }));
-            events.push({ type: 'BOOT_PROBE_ENTRY', detail: { side: this.ctx.side, qty } });
-            this.ctx.bootAttemptAtMs = input.nowMs;
-          }
-        }
+    if (this.ctx.planState !== 'EXITING') {
+      const remainingBudget = this.remainingBudget(position, midPrice, leverage);
+      if (remainingBudget > 0) {
+        const scaleIn = this.buildScaleInOrders({
+          symbol,
+          side: this.ctx.side,
+          budgetUsdt: remainingBudget,
+          leverage,
+          basePrice: midPrice,
+          position,
+          trendState,
+          trendConfirmed,
+          gatePassed,
+        });
+        desired.push(...scaleIn);
       }
-    }
-
-    const remainingBudget = this.remainingBudget(position, midPrice, leverage);
-    if (remainingBudget > 0) {
-      const scaleIn = this.buildScaleInOrders({
-        symbol,
-        side: this.ctx.side,
-        budgetUsdt: remainingBudget,
-        leverage,
-        basePrice: midPrice,
-        position,
-        trendState,
-        trendConfirmed,
-        gatePassed,
-      });
-      desired.push(...scaleIn);
     }
 
     if (position) {
@@ -454,7 +504,7 @@ export class PlanRunner {
       desired.push(...tpOrders);
     }
 
-    if (this.ctx.planState === 'EXITING' && position) {
+    if (this.ctx.planState === 'EXITING' && position && this.config.reversalExitMode === 'LIMIT') {
       const exitOrder = this.buildExitOrder(symbol, position, input.metrics);
       if (exitOrder) {
         desired.push(exitOrder);
@@ -498,9 +548,17 @@ export class PlanRunner {
       return [];
     }
 
-    if (input.position && this.config.scaleIn.addMinUpnlUsdt > 0) {
-      if (input.position.unrealizedPnlPct < this.config.scaleIn.addMinUpnlUsdt) {
+    if (input.position) {
+      const upnl = input.position.unrealizedPnlPct;
+      if (this.config.scaleIn.addMinUpnlUsdt > 0 && upnl < this.config.scaleIn.addMinUpnlUsdt) {
         return [];
+      }
+      if (this.config.scaleIn.addMinUpnlR > 0) {
+        const base = Math.max(1, this.ctx.budgetUsdt || 1);
+        const upnlR = upnl / base;
+        if (upnlR < this.config.scaleIn.addMinUpnlR) {
+          return [];
+        }
       }
     }
 
@@ -565,7 +623,7 @@ export class PlanRunner {
         levelIndex: i,
         price,
         qty,
-        reduceOnly: true,
+        reduceOnly: this.config.tp.reduceOnly,
       }));
     }
     return orders;

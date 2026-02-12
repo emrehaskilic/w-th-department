@@ -1,6 +1,8 @@
 import { ExecutionEvent } from '../connectors/executionTypes';
 import { DecisionEngine } from './Decision';
 import { assessFreezeFromExecQuality } from './FreezeController';
+import { PlanRunner, PlanTickResult } from './PlanRunner';
+import { parseClientOrderId } from './OrderPlan';
 import { ExecQualityLevel } from './types';
 import {
   ActorEnvelope,
@@ -14,6 +16,7 @@ import {
 export interface SymbolActorDeps {
   symbol: string;
   decisionEngine: DecisionEngine;
+  planRunner?: PlanRunner;
   onActions: (actions: DecisionAction[]) => Promise<void>;
   onDecisionLogged: (record: {
     symbol: string;
@@ -41,11 +44,16 @@ export interface SymbolActorDeps {
     state: SymbolState;
   }) => void;
   onExecutionLogged: (event: ExecutionEvent | (ExecutionEvent & { slippage_bps?: number; execution_latency_ms?: number }), state: SymbolState) => void;
+  onPlanLogged?: (record: any) => void;
+  onPlanActions?: (result: PlanTickResult) => Promise<void>;
+  onPlanEvent?: (event: { type: string; detail?: Record<string, any> }) => void;
+  planOrderPrefix?: string;
   getExpectedOrderMeta: (orderId: string) => { expectedPrice: number | null; sentAtMs: number; tag: 'entry' | 'add' | 'exit' } | null;
   getStartingMarginUsdt: () => number;
   getCurrentMarginBudgetUsdt: () => number;
   getRampMult: () => number;
   getEffectiveLeverage: () => number;
+  getExecutionReady?: () => boolean;
   onPositionClosed: (realizedPnl: number) => void;
   markAddUsed: () => void;
   cooldownConfig: { minMs: number; maxMs: number };
@@ -120,7 +128,82 @@ export class SymbolActor {
     this.lastPrintsPerSecond = envelope.metrics.prints_per_second || 0;
     this.updateExecQualityFromMetrics(envelope.metrics.spread_pct);
 
-    // State Machine Guard: If pending entry, DO NOT EVALUATE
+    if (this.deps.planRunner) {
+      const executionReady = this.deps.getExecutionReady ? this.deps.getExecutionReady() : false;
+      const result = this.deps.planRunner.tick({
+        symbol: envelope.symbol,
+        nowMs: envelope.canonical_time_ms,
+        metrics: envelope.metrics,
+        gatePassed: envelope.gate.passed,
+        state: this.state,
+        executionReady,
+        leverage: this.deps.getEffectiveLeverage(),
+        currentMarginBudgetUsdt: this.deps.getCurrentMarginBudgetUsdt(),
+        startingMarginUsdt: this.deps.getStartingMarginUsdt(),
+      });
+
+      const dataGaps: string[] = [];
+      if (!this.state.execQuality.metricsPresent) {
+        dataGaps.push('exec_metrics_missing');
+      }
+      if (this.state.execQuality.lastSpreadPct === null) {
+        dataGaps.push('spread_missing');
+      }
+      if (this.state.execQuality.lastLatencyMs === null) {
+        dataGaps.push('latency_missing');
+      }
+      if (this.state.execQuality.lastSlippageBps === null) {
+        dataGaps.push('slippage_missing');
+      }
+
+      const executionMode: 'NORMAL' | 'DEGRADED' | 'FREEZE' =
+        this.state.execQuality.freezeActive
+          ? 'FREEZE'
+          : envelope.gate.mode === GateMode.V1_NO_LATENCY
+            ? 'DEGRADED'
+            : 'NORMAL';
+
+      this.deps.onPlanLogged?.({
+        ts: envelope.canonical_time_ms,
+        symbol: envelope.symbol,
+        gate: envelope.gate,
+        executionMode,
+        execQuality: this.state.execQuality.quality,
+        execMetricsPresent: this.state.execQuality.metricsPresent,
+        freezeActive: this.state.execQuality.freezeActive,
+        dataGaps,
+        trendState: result.trendState,
+        trendScore: result.trendScore,
+        confirmCount: result.confirmCount,
+        plan_id: result.planId,
+        plan_state: result.planState,
+        position: this.state.position
+          ? {
+            side: this.state.position.side,
+            qty: this.state.position.qty,
+            entry: this.state.position.entryPrice,
+            uPnL: this.state.position.unrealizedPnlPct,
+          }
+          : null,
+        desired_orders_count: result.desiredOrders.length,
+        immediate_orders_count: result.immediateOrders.length,
+        open_orders_count: result.summary.openOrdersCount,
+        actions: result.summary.actions,
+      });
+
+      if (result.events.length > 0) {
+        for (const event of result.events) {
+          this.deps.onPlanEvent?.({ type: event.type, detail: { symbol: envelope.symbol, planId: result.planId, ...event.detail } });
+        }
+      }
+
+      if (this.deps.onPlanActions) {
+        await this.deps.onPlanActions(result);
+      }
+      return;
+    }
+
+    // State Machine Guard: If pending entry, DO NOT EVALUATE (decision-engine mode)
     if (this.state.pendingEntry || this.state.hasOpenEntryOrder) {
       return;
     }
@@ -245,6 +328,26 @@ export class SymbolActor {
 
       this.state.hasOpenEntryOrder = Array.from(this.state.openOrders.values()).some((o) => !o.reduceOnly);
       this.deps.onExecutionLogged(event, this.snapshotState());
+
+      if (terminal && event.status === 'FILLED' && event.clientOrderId) {
+        const tag = parseClientOrderId(event.clientOrderId, this.deps.planOrderPrefix);
+        if (tag?.role === 'TP') {
+          this.deps.onPlanEvent?.({
+            type: 'TP_FILLED',
+            detail: { symbol: event.symbol, orderId: event.orderId, clientOrderId: event.clientOrderId, qty: event.executedQty, price: event.price },
+          });
+        } else if (tag?.role === 'SCALE_IN') {
+          this.deps.onPlanEvent?.({
+            type: 'ADD_EXECUTED',
+            detail: { symbol: event.symbol, orderId: event.orderId, clientOrderId: event.clientOrderId, qty: event.executedQty, price: event.price },
+          });
+        } else if (tag?.role === 'BOOT_PROBE') {
+          this.deps.onPlanEvent?.({
+            type: 'BOOT_PROBE_ENTRY',
+            detail: { symbol: event.symbol, orderId: event.orderId, clientOrderId: event.clientOrderId, qty: event.executedQty, price: event.price },
+          });
+        }
+      }
       return;
     }
 
