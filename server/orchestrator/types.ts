@@ -72,6 +72,7 @@ export interface OpenOrderState {
   status: string;
   origQty: number;
   executedQty: number;
+  price: number;
   reduceOnly: boolean;
   event_time_ms: number;
 }
@@ -131,6 +132,71 @@ export interface SymbolState {
   execQuality: ExecQualityState;
 }
 
+export interface OrderPlanConfig {
+  planEpochMs: number;
+  orderPrefix: string;
+  planRebuildCooldownMs: number;
+  orderPriceTolerancePct: number;
+  orderQtyTolerancePct: number;
+  replaceThrottlePerSecond: number;
+  cancelStalePlanOrders: boolean;
+  boot: {
+    probeMarketPct: number;
+    waitReadyMs: number;
+    maxSpreadPct: number;
+    minObiDeep: number;
+    minDeltaZ: number;
+    allowMarket: boolean;
+    retryMs: number;
+  };
+  trend: {
+    upEnter: number;
+    upExit: number;
+    downEnter: number;
+    downExit: number;
+    confirmTicks: number;
+    reversalConfirmTicks: number;
+    obiNorm: number;
+    deltaNorm: number;
+    cvdNorm: number;
+    scoreClamp: number;
+  };
+  scaleIn: {
+    levels: number;
+    stepPct: number;
+    maxAdds: number;
+    addOnlyIfTrendConfirmed: boolean;
+    addMinUpnlUsdt: number;
+    addMinUpnlR: number;
+  };
+  tp: {
+    levels: number;
+    stepPcts: number[];
+    distribution: number[];
+    reduceOnly: boolean;
+  };
+  profitLock: {
+    lockTriggerUsdt: number;
+    lockTriggerR: number;
+    maxDdFromPeakUsdt: number;
+    maxDdFromPeakR: number;
+  };
+  reversalExitMode: 'MARKET' | 'LIMIT';
+  exitLimitBufferBps: number;
+  exitRetryMs: number;
+  allowFlip: boolean;
+  initialMarginUsdt: number;
+  maxMarginUsdt: number;
+  stepUp: {
+    mode: 'UPNL' | 'R_MULTIPLE' | 'TREND_SCORE';
+    stepPct: number;
+    triggerUsdt: number;
+    triggerR: number;
+    minTrendScore: number;
+    cooldownMs: number;
+  };
+}
+
 export interface OrchestratorConfig {
   maxLeverage: number;
   loggerQueueLimit: number;
@@ -146,5 +212,6 @@ export interface OrchestratorConfig {
   liquidationEmergencyMarginRatio: number;
   takerFeeBps: number;
   profitLockBufferBps: number;
+  plan: OrderPlanConfig;
 }
 

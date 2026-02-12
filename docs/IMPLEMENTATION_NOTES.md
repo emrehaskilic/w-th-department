@@ -29,5 +29,12 @@
 
 ## Security & Integrity
 - **Kill-Switch:** Default state is SAFE (execution disabled).
-- **Execution Level:** DRY-RUN by default unless `EXECUTION_MODE=live` and `EXECUTION_ENABLED=true`.
+- **Execution Level:** Orders only allowed when `EXECUTION_ENABLED=true`, kill switch is off, connector has keys, and readiness is true.
 - **Determinism:** Each metrics snapshot contains a `stateHash` to verify output stability.
+
+## Current Execution/Strategy/Risk/Telemetry Paths (Discovery)
+- **Order send/cancel:** `server/connectors/ExecutionConnector.ts` (`placeOrder`, `cancelOrder`, `syncState`) and `server/execution/BinanceExecutor.ts` (`execute`).
+- **Execution wiring:** `server/orchestrator/Orchestrator.ts` (`handleActions` → `BinanceExecutor.execute`) and `server/index.ts` (`broadcastMetrics` → `orchestrator.ingest`).
+- **Strategy loop:** `server/index.ts` (trade/depth events → `StrategyEngine.compute` → `broadcastMetrics`) and `server/strategy/StrategyEngine.ts`.
+- **Risk/cooldown:** `server/risk/RiskManager.ts` (cooldown/notional), `server/orchestrator/SizingRamp.ts` (budget ramp).
+- **Telemetry/logs:** `server/orchestrator/Logger.ts` (metrics/decision/execution JSONL), `server/orchestrator/Actor.ts` (decision/execution logging), `server/orchestrator/Orchestrator.ts` (ORDER_ATTEMPT_AUDIT stdout).

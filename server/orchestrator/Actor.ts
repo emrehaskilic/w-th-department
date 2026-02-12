@@ -237,6 +237,7 @@ export class SymbolActor {
           status: event.status,
           origQty: event.origQty,
           executedQty: event.executedQty,
+          price: event.price,
           reduceOnly: event.reduceOnly,
           event_time_ms: event.event_time_ms,
         });
@@ -252,6 +253,7 @@ export class SymbolActor {
       for (const order of event.orders) {
         this.state.openOrders.set(order.orderId, {
           ...order,
+          price: order.price,
           event_time_ms: event.event_time_ms,
         });
       }
