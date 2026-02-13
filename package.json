@@ -12,7 +12,11 @@
     "build:all": "npm run build:server && npm run build",
     "preview": "vite preview",
     "install:all": "npm install && cd server && npm install",
-    "test": "cd server && npm test"
+    "test": "cd server && npm test",
+    "test:frontend": "vitest run",
+    "test:frontend:watch": "vitest",
+    "test:frontend:coverage": "vitest run --coverage",
+    "test:all": "npm run test && npm run test:frontend"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -24,11 +28,16 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
+    "@vitest/coverage-v8": "^2.1.8",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
     "autoprefixer": "^10.4.24",
     "concurrently": "^8.2.2",
+    "jsdom": "^25.0.1",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18",
     "typescript": "^5.5.3",
-    "vite": "^5.4.1"
+    "vite": "^5.4.1",
+    "vitest": "^2.1.8"
   }
 }

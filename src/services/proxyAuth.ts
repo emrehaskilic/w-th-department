@@ -1,6 +1,7 @@
-const PROXY_API_KEY = String((import.meta as any).env?.VITE_PROXY_API_KEY || '').trim();
-if (!PROXY_API_KEY) {
-    throw new Error('Missing VITE_PROXY_API_KEY. Set it in your frontend environment (e.g. .env.local).');
+export const PROXY_API_KEY = String(import.meta.env.VITE_PROXY_API_KEY || '').trim();
+
+export function isProxyApiKeyConfigured(): boolean {
+    return PROXY_API_KEY.length > 0;
 }
 
 function toBase64Url(value: string): string {
@@ -14,7 +15,9 @@ function toBase64Url(value: string): string {
 
 export function withProxyApiKey(init: RequestInit = {}): RequestInit {
     const headers = new Headers(init.headers || {});
-    headers.set('Authorization', `Bearer ${PROXY_API_KEY}`);
+    if (isProxyApiKeyConfigured()) {
+        headers.set('Authorization', `Bearer ${PROXY_API_KEY}`);
+    }
     return {
         ...init,
         headers,
@@ -22,5 +25,8 @@ export function withProxyApiKey(init: RequestInit = {}): RequestInit {
 }
 
 export function proxyWebSocketProtocols(): string[] {
+    if (!isProxyApiKeyConfigured()) {
+        return ['proxy-auth'];
+    }
     return ['proxy-auth', `bearer.${toBase64Url(PROXY_API_KEY)}`];
 }

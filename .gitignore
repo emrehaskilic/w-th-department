@@ -9,3 +9,5 @@ server/dist/
 .idea/
 .vscode/
 repo
+health_check_result.json
+server/health-report.json

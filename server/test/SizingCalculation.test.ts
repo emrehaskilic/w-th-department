@@ -1,6 +1,4 @@
-function assert(condition: any, message: string): void {
-  if (!condition) throw new Error(message);
-}
+import assert from 'node:assert/strict';
 
 import { computeSizingFromBudget } from '../orchestrator/SizingMath';
 

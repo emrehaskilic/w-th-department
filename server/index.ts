@@ -1091,6 +1091,15 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use('/api', apiKeyMiddleware);
+app.get(
+    ['/health-report.json', '/health_check_result.json', '/server/health-report.json'],
+    (_req, res) => {
+        res.status(404).json({
+            ok: false,
+            error: 'not_found',
+        });
+    }
+);
 
 app.get('/api/health', (req, res) => {
     res.json({

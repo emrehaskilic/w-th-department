@@ -11,6 +11,16 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5174,
       host: devHost,
-    }
+    },
+    test: {
+      globals: true,
+      environment: 'jsdom',
+      setupFiles: './src/setupTests.ts',
+      css: false,
+      coverage: {
+        provider: 'v8',
+        reporter: ['text', 'json', 'html'],
+      },
+    },
   };
 });
