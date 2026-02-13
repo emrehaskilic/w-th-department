@@ -6,6 +6,7 @@ import { IExecutor } from '../execution/types';
 import { TradeLogger } from '../logger/TradeLogger';
 import { FundingRateMonitor } from '../metrics/FundingRateMonitor';
 import { RiskManager } from '../risk/RiskManager';
+import { logger } from '../utils/logger';
 import { SymbolActor } from './Actor';
 import { DecisionEngine } from './Decision';
 import { runGate } from './Gate';
@@ -329,11 +330,7 @@ export class Orchestrator {
   }
 
   private log(event: string, data: any = {}) {
-    console.log(JSON.stringify({
-      ts: new Date().toISOString(),
-      event,
-      ...data
-    }));
+    logger.info(event, data);
   }
 
   private refreshFundingIfNeeded(symbol: string) {

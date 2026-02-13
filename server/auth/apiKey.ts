@@ -2,11 +2,9 @@ import { timingSafeEqual } from 'crypto';
 import { IncomingMessage } from 'http';
 import { NextFunction, Request, Response } from 'express';
 
-const DEFAULT_DEV_API_KEY = 'local-dev-api-key';
-const API_KEY_SECRET = (process.env.API_KEY_SECRET || DEFAULT_DEV_API_KEY).trim();
-
-if (!process.env.API_KEY_SECRET) {
-    console.warn('[auth] API_KEY_SECRET is not set, using development fallback key');
+const API_KEY_SECRET = String(process.env.API_KEY_SECRET || '').trim();
+if (!API_KEY_SECRET) {
+    throw new Error('[auth] Missing API_KEY_SECRET. Set it in server/.env before starting the backend.');
 }
 
 function safeEquals(a: string, b: string): boolean {
@@ -16,14 +14,6 @@ function safeEquals(a: string, b: string): boolean {
         return false;
     }
     return timingSafeEqual(left, right);
-}
-
-function getApiKeyFromHeader(headers: IncomingMessage['headers']): string {
-    const raw = headers['x-api-key'];
-    if (Array.isArray(raw)) {
-        return String(raw[0] || '').trim();
-    }
-    return String(raw || '').trim();
 }
 
 function getApiKeyFromAuthorization(headers: IncomingMessage['headers']): string {
@@ -36,14 +26,32 @@ function getApiKeyFromAuthorization(headers: IncomingMessage['headers']): string
     return '';
 }
 
-function getApiKeyFromQuery(req: IncomingMessage): string {
-    const url = req.url || '/';
-    const parsed = new URL(url, 'http://localhost');
-    return String(parsed.searchParams.get('apiKey') || '').trim();
+function decodeBase64UrlToken(value: string): string {
+    try {
+        return Buffer.from(value, 'base64url').toString('utf8').trim();
+    } catch {
+        return '';
+    }
+}
+
+function getApiKeyFromWebSocketProtocol(headers: IncomingMessage['headers']): string {
+    const raw = headers['sec-websocket-protocol'];
+    const protocolHeader = Array.isArray(raw) ? String(raw[0] || '') : String(raw || '');
+    if (!protocolHeader) {
+        return '';
+    }
+
+    const protocols = protocolHeader.split(',').map((p) => p.trim()).filter(Boolean);
+    const bearerProtocol = protocols.find((p) => p.startsWith('bearer.'));
+    if (!bearerProtocol) {
+        return '';
+    }
+
+    return decodeBase64UrlToken(bearerProtocol.slice('bearer.'.length));
 }
 
 function extractApiKey(req: IncomingMessage): string {
-    return getApiKeyFromHeader(req.headers) || getApiKeyFromAuthorization(req.headers) || getApiKeyFromQuery(req);
+    return getApiKeyFromAuthorization(req.headers) || getApiKeyFromWebSocketProtocol(req.headers);
 }
 
 export function isApiKeyValid(apiKey: string): boolean {
@@ -59,7 +67,7 @@ export function apiKeyMiddleware(req: Request, res: Response, next: NextFunction
         res.status(401).json({
             ok: false,
             error: 'unauthorized',
-            message: 'Provide a valid API key in X-API-Key header or apiKey query parameter.',
+            message: 'Provide a valid bearer token in the Authorization header.',
         });
         return;
     }

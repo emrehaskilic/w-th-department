@@ -11,7 +11,7 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
 
-import express, { Request, Response } from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import { createServer } from 'http';
 import { WebSocket, WebSocketServer } from 'ws';
 import cors from 'cors';
@@ -43,7 +43,9 @@ import { SymbolEventQueue } from './utils/SymbolEventQueue';
 import { SnapshotTracker } from './telemetry/Snapshot';
 import { apiKeyMiddleware, validateWebSocketApiKey } from './auth/apiKey';
 import { StrategyEngine } from './strategy/StrategyEngine';
-import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService } from './dryrun';
+import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService, isUpstreamGuardError } from './dryrun';
+import { logger, requestLogger, serializeError } from './utils/logger';
+import { WebSocketManager } from './ws/WebSocketManager';
 
 // =============================================================================
 // Configuration
@@ -87,6 +89,8 @@ const WS_UPDATE_SPEED = String(process.env.WS_UPDATE_SPEED || '250ms'); // 100ms
 const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
 const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
+const CLIENT_HEARTBEAT_INTERVAL_MS = Number(process.env.CLIENT_HEARTBEAT_INTERVAL_MS || 15000);
+const CLIENT_STALE_CONNECTION_MS = Number(process.env.CLIENT_STALE_CONNECTION_MS || 60000);
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
@@ -105,12 +109,16 @@ const EXECUTION_ENV = 'testnet';
 // =============================================================================
 
 function log(event: string, data: any = {}) {
-    console.log(JSON.stringify({
-        ts: new Date().toISOString(),
-        event,
-        ...data
-    }));
+    logger.info(event, data);
 }
+
+process.on('unhandledRejection', (reason) => {
+    logger.error('PROCESS_UNHANDLED_REJECTION', { reason: serializeError(reason) });
+});
+
+process.on('uncaughtException', (error) => {
+    logger.error('PROCESS_UNCAUGHT_EXCEPTION', { error: serializeError(error) });
+});
 
 function getExecutionGateState() {
     const status = orchestrator.getExecutionStatus();
@@ -506,8 +514,16 @@ let ws: WebSocket | null = null;
 let wsState = 'disconnected';
 let activeSymbols = new Set<string>();
 const dryRunForcedSymbols = new Set<string>();
-const clients = new Set<WebSocket>();
-const clientSubs = new Map<WebSocket, Set<string>>();
+const wsManager = new WebSocketManager({
+    onSubscriptionsChanged: () => {
+        updateStreams();
+    },
+    log: (event, data = {}) => {
+        log(event, data);
+    },
+    heartbeatIntervalMs: CLIENT_HEARTBEAT_INTERVAL_MS,
+    staleConnectionMs: CLIENT_STALE_CONNECTION_MS,
+});
 let autoScaleForcedSingle = false;
 
 function buildDepthStream(symbolLower: string): string {
@@ -518,14 +534,8 @@ function buildDepthStream(symbolLower: string): string {
 }
 
 function updateStreams() {
-    const required = new Set<string>();
-    clients.forEach(c => {
-        const subs = clientSubs.get(c);
-        if (subs) subs.forEach(s => required.add(s));
-    });
-
     const forcedSorted = [...dryRunForcedSymbols].sort();
-    const requiredSorted = [...required].sort();
+    const requiredSorted = wsManager.getRequiredSymbols();
     const limitedSymbols = requiredSorted.slice(0, Math.max(AUTO_SCALE_MIN_SYMBOLS, symbolConcurrencyLimit));
     const effective = new Set<string>([...forcedSorted, ...limitedSymbols]);
 
@@ -981,13 +991,7 @@ function broadcastMetrics(
     };
 
     const str = JSON.stringify(payload);
-    let sentCount = 0;
-    clients.forEach(c => {
-        if (c.readyState === WebSocket.OPEN && clientSubs.get(c)?.has(s)) {
-            c.send(str);
-            sentCount++;
-        }
-    });
+    const sentCount = wsManager.broadcastToSymbol(s, str);
 
     // Update counters
     meta.lastBroadcastTs = now;
@@ -1058,6 +1062,7 @@ function broadcastMetrics(
 
 const app = express();
 app.use(express.json());
+app.use(requestLogger);
 
 // CORS configuration - more permissive for development, restrictive for production
 const corsOptions = {
@@ -1082,7 +1087,7 @@ const corsOptions = {
     },
     credentials: true,
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
 };
 app.use(cors(corsOptions));
 app.use('/api', apiKeyMiddleware);
@@ -1093,6 +1098,7 @@ app.get('/api/health', (req, res) => {
         executionEnabled: EXECUTION_ENABLED,
         killSwitch: KILL_SWITCH,
         activeSymbols: Array.from(activeSymbols),
+        wsClients: wsManager.getClientCount(),
         wsState
     });
 });
@@ -1444,12 +1450,60 @@ app.post('/api/dry-run/run', (req, res) => {
         const result = engine.run(events);
         res.json({ ok: true, logs: result.logs, finalState: result.finalState });
     } catch (e: any) {
+        if (isUpstreamGuardError(e)) {
+            log('DRY_RUN_UPSTREAM_GUARD_REJECT', { code: e.code, details: e.details || {} });
+            res.status(e.statusCode).json({ ok: false, error: e.code, message: e.message, details: e.details || {} });
+            return;
+        }
+        log('DRY_RUN_RUN_ERROR', { error: serializeError(e) });
         res.status(500).json({ ok: false, error: e.message || 'dry_run_failed' });
     }
 });
 
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+    const statusCode = Number.isFinite(err?.statusCode) ? Number(err.statusCode) : 500;
+    const errorCode = typeof err?.code === 'string' ? err.code : 'internal_server_error';
+    logger.error('HTTP_UNHANDLED_ERROR', {
+        method: req.method,
+        path: req.originalUrl || req.url,
+        statusCode,
+        errorCode,
+        error: serializeError(err),
+    });
+
+    if (res.headersSent) {
+        next(err);
+        return;
+    }
+
+    const message = statusCode >= 500
+        ? 'Internal server error'
+        : String(err?.message || 'request_failed');
+
+    res.status(statusCode).json({
+        ok: false,
+        error: errorCode,
+        message,
+    });
+});
+
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
+
+function shutdown(): void {
+    wsManager.shutdown();
+    if (ws) {
+        ws.close();
+        ws = null;
+    }
+    wss.close();
+    server.close(() => {
+        process.exit(0);
+    });
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 wss.on('connection', (wc, req) => {
     const authResult = validateWebSocketApiKey(req);
@@ -1464,10 +1518,9 @@ wss.on('connection', (wc, req) => {
 
     const p = new URL(req.url || '', 'http://l').searchParams.get('symbols') || '';
     const syms = p.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-
-    clients.add(wc);
-    clientSubs.set(wc, new Set(syms));
-    log('CLIENT_JOIN', { symbols: syms });
+    wsManager.registerClient(wc, syms, {
+        remoteAddress: req.socket.remoteAddress || null,
+    });
 
     syms.forEach(s => {
         // Trigger initial seed if needed
@@ -1476,14 +1529,6 @@ wss.on('connection', (wc, req) => {
             transitionOrderbookState(s, 'SNAPSHOT_PENDING', 'client_subscribe_init');
             fetchSnapshot(s, 'client_subscribe_init', true);
         }
-    });
-
-    updateStreams();
-
-    wc.on('close', () => {
-        clients.delete(wc);
-        clientSubs.delete(wc);
-        updateStreams();
     });
 });
 

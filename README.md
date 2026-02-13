@@ -65,5 +65,5 @@ The backend sends a `MetricsMessage` to the frontend containing:
 ### Quick Start
 1. `npm run install:all`
 2. Create `server/.env` from `server/.env.example` and set `API_KEY_SECRET`.
-3. Set `VITE_PROXY_API_KEY` in frontend env to the same value.
+3. Set `VITE_PROXY_API_KEY` in frontend env to the same value (required).
 4. `npm run dev:all` (Frontend: 5174, Backend: 8787)

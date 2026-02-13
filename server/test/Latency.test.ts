@@ -1,7 +1,5 @@
 // Regression test: TimeAndSales should compute without latency fields.
-function assert(condition: any, message: string): void {
-  if (!condition) throw new Error(message);
-}
+import assert from 'node:assert/strict';
 
 import { TimeAndSales } from '../metrics/TimeAndSales';
 

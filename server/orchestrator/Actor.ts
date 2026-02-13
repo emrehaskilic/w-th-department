@@ -1,4 +1,5 @@
 import { ExecutionEvent } from '../connectors/executionTypes';
+import { logger } from '../utils/logger';
 import { DecisionEngine } from './Decision';
 import { assessFreezeFromExecQuality } from './FreezeController';
 import { PlanRunner, PlanTickResult } from './PlanRunner';
@@ -122,7 +123,10 @@ export class SymbolActor {
       this.processing = true;
       setImmediate(() => {
         this.processQueue().catch((e) => {
-          console.error(`[ACTOR ${this.deps.symbol}] processQueue error:`, e);
+          logger.error('ACTOR_PROCESS_QUEUE_ERROR', {
+            symbol: this.deps.symbol,
+            error: e,
+          });
           this.processing = false;
         });
       });
@@ -429,7 +433,12 @@ export class SymbolActor {
 
       // FAIL-SAFE: If equity drops significantly (> 50 USDT) while FLAT, assume State Blindness and HALT.
       if (!hadPosition && this.state.walletBalance > 0 && event.walletBalance < this.state.walletBalance - 50) {
-        console.error(`[ACTOR ${this.deps.symbol}] CRITICAL FAIL-SAFE: Equity drop detected without position! ${this.state.walletBalance} -> ${event.walletBalance}. HALTING.`);
+        logger.error('ACTOR_FAILSAFE_EQUITY_DROP', {
+          symbol: this.deps.symbol,
+          previousWalletBalance: this.state.walletBalance,
+          currentWalletBalance: event.walletBalance,
+          message: 'Equity drop detected without tracked open position. Actor halted.',
+        });
         this.state.halted = true;
       }
 
