@@ -13,6 +13,11 @@ export interface OrchestratorMetricsInput {
     deltaZ?: number | null;
     cvdSlope?: number | null;
   } | null;
+  funding?: {
+    rate?: number | null;
+    timeToFundingMs?: number | null;
+    trend?: 'up' | 'down' | 'flat' | null;
+  } | null;
 }
 
 export type ExecQualityLevel = 'UNKNOWN' | 'GOOD' | 'BAD';
@@ -136,6 +141,9 @@ export interface OrderPlanConfig {
   planEpochMs: number;
   orderPrefix: string;
   planRebuildCooldownMs: number;
+  minMarginUsdt: number;
+  limitBufferBps: number;
+  defaultTickSize: number;
   orderPriceTolerancePct: number;
   orderQtyTolerancePct: number;
   replaceThrottlePerSecond: number;
@@ -173,6 +181,10 @@ export interface OrderPlanConfig {
     levels: number;
     stepPcts: number[];
     distribution: number[];
+    reduceOnly: boolean;
+  };
+  stop: {
+    distancePct: number;
     reduceOnly: boolean;
   };
   profitLock: {
@@ -214,4 +226,3 @@ export interface OrchestratorConfig {
   profitLockBufferBps: number;
   plan: OrderPlanConfig;
 }
-

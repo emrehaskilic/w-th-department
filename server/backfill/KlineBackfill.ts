@@ -9,6 +9,7 @@ export interface KlineData {
 
 export interface SymbolBackfillState {
     atr: number;
+    avgAtr: number;
     recentHigh: number;
     recentLow: number;
     ready: boolean;
@@ -20,6 +21,7 @@ export class KlineBackfill {
     private restBaseUrl: string;
     private state: SymbolBackfillState = {
         atr: 0,
+        avgAtr: 0,
         recentHigh: 0,
         recentLow: 0,
         ready: false,
@@ -58,6 +60,7 @@ export class KlineBackfill {
 
             // Compute ATR (Simple)
             let totalTr = 0;
+            const trSeries: number[] = [];
             for (let i = 1; i < klines.length; i++) {
                 const tr = Math.max(
                     klines[i].high - klines[i].low,
@@ -65,8 +68,13 @@ export class KlineBackfill {
                     Math.abs(klines[i].low - klines[i - 1].close)
                 );
                 totalTr += tr;
+                trSeries.push(tr);
             }
-            this.state.atr = totalTr / (klines.length - 1);
+            this.state.avgAtr = totalTr / (klines.length - 1);
+            const atrWindow = trSeries.slice(-14);
+            this.state.atr = atrWindow.length > 0
+                ? atrWindow.reduce((sum, v) => sum + v, 0) / atrWindow.length
+                : this.state.avgAtr;
 
             // Recent High/Low (Window)
             let high = -Infinity;

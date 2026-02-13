@@ -54,7 +54,25 @@ export interface SymbolActorDeps {
   getRampMult: () => number;
   getEffectiveLeverage: () => number;
   getExecutionReady?: () => boolean;
-  onPositionClosed: (realizedPnl: number) => void;
+  getBackoffActive?: () => boolean;
+  getFundingShortBlocked?: () => boolean;
+  onPositionClosed: (close: {
+    realizedPnl: number;
+    side: 'LONG' | 'SHORT';
+    qty: number;
+    entryPrice: number;
+    exitPrice: number;
+    openTimeMs: number;
+    closeTimeMs: number;
+    reason?: string;
+    signalType?: string;
+    orderflow?: {
+      obiWeighted?: number | null;
+      obiDeep?: number | null;
+      deltaZ?: number | null;
+      cvdSlope?: number | null;
+    };
+  }) => void;
   markAddUsed: () => void;
   cooldownConfig: { minMs: number; maxMs: number };
 }
@@ -63,8 +81,12 @@ export class SymbolActor {
   private readonly queue: ActorEnvelope[] = [];
   private processing = false;
   private lastDeltaZ = 0;
+  private lastObiDeep = 0;
+  private lastCvdSlope = 0;
   private lastPrintsPerSecond = 0;
   private pendingClosedTradeRealizedPnl = 0;
+  private positionOpenedAtMs: number | null = null;
+  private lastTradeFillPrice = 0;
 
   readonly state: SymbolState;
 
@@ -125,6 +147,8 @@ export class SymbolActor {
 
   private async onMetrics(envelope: MetricsEventEnvelope) {
     this.lastDeltaZ = envelope.metrics.legacyMetrics?.deltaZ || 0;
+    this.lastObiDeep = envelope.metrics.legacyMetrics?.obiDeep || 0;
+    this.lastCvdSlope = envelope.metrics.legacyMetrics?.cvdSlope || 0;
     this.lastPrintsPerSecond = envelope.metrics.prints_per_second || 0;
     this.updateExecQualityFromMetrics(envelope.metrics.spread_pct);
 
@@ -140,6 +164,9 @@ export class SymbolActor {
         leverage: this.deps.getEffectiveLeverage(),
         currentMarginBudgetUsdt: this.deps.getCurrentMarginBudgetUsdt(),
         startingMarginUsdt: this.deps.getStartingMarginUsdt(),
+        freezeActive: this.state.execQuality.freezeActive,
+        backoffActive: this.deps.getBackoffActive ? this.deps.getBackoffActive() : false,
+        fundingShortBlocked: this.deps.getFundingShortBlocked ? this.deps.getFundingShortBlocked() : false,
       });
 
       const dataGaps: string[] = [];
@@ -369,6 +396,7 @@ export class SymbolActor {
 
     if (event.type === 'TRADE_UPDATE') {
       this.pendingClosedTradeRealizedPnl += event.realizedPnl;
+      this.lastTradeFillPrice = Number(event.fillPrice || this.lastTradeFillPrice || 0);
       const expected = this.deps.getExpectedOrderMeta(event.orderId);
       let derivedLatencyMs: number | undefined;
       let derivedSlippageBps: number | undefined;
@@ -397,6 +425,7 @@ export class SymbolActor {
 
     if (event.type === 'ACCOUNT_UPDATE') {
       const hadPosition = this.state.position !== null;
+      const previousPosition = this.state.position ? { ...this.state.position } : null;
 
       // FAIL-SAFE: If equity drops significantly (> 50 USDT) while FLAT, assume State Blindness and HALT.
       if (!hadPosition && this.state.walletBalance > 0 && event.walletBalance < this.state.walletBalance - 50) {
@@ -427,11 +456,36 @@ export class SymbolActor {
           profitLockActivated: sideChanged ? false : (this.state.position?.profitLockActivated ?? false),
           hardStopPrice: sideChanged ? null : (this.state.position?.hardStopPrice ?? null),
         };
+        if (!hadPosition || Boolean(sideChanged)) {
+          this.positionOpenedAtMs = event.event_time_ms;
+        }
       }
 
       if (hadPosition && this.state.position === null) {
-        this.deps.onPositionClosed(this.pendingClosedTradeRealizedPnl);
+        const closeSide = previousPosition?.side || (event.positionAmt >= 0 ? 'LONG' : 'SHORT');
+        const closeQty = previousPosition?.qty || qty;
+        const closeEntry = previousPosition?.entryPrice || event.entryPrice || 0;
+        const closeExit = this.lastTradeFillPrice > 0 ? this.lastTradeFillPrice : closeEntry;
+        this.deps.onPositionClosed({
+          realizedPnl: this.pendingClosedTradeRealizedPnl,
+          side: closeSide,
+          qty: closeQty,
+          entryPrice: closeEntry,
+          exitPrice: closeExit,
+          openTimeMs: this.positionOpenedAtMs || event.event_time_ms,
+          closeTimeMs: event.event_time_ms,
+          reason: 'ACCOUNT_POSITION_ZERO',
+          signalType: 'PLAN',
+          orderflow: {
+            obiWeighted: null,
+            obiDeep: this.lastObiDeep,
+            deltaZ: this.lastDeltaZ,
+            cvdSlope: this.lastCvdSlope,
+          },
+        });
         this.pendingClosedTradeRealizedPnl = 0;
+        this.positionOpenedAtMs = null;
+        this.lastTradeFillPrice = 0;
         this.state.last_exit_event_time_ms = event.event_time_ms;
         const cooldownMs = this.deps.decisionEngine.computeCooldownMs(
           this.lastDeltaZ,

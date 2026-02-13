@@ -1,9 +1,10 @@
 import { DecisionAction, GateResult, OrchestratorMetricsInput, SymbolState } from './types';
 import { evaluateHardStop } from './HardStopGuard';
 import { liquidationRiskTriggered } from './LiquidationGuard';
+import { OrderType } from '../connectors/executionTypes';
 
 export interface DecisionDependencies {
-  expectedPrice: (symbol: string, side: 'BUY' | 'SELL', type: 'MARKET' | 'LIMIT', limitPrice?: number) => number | null;
+  expectedPrice: (symbol: string, side: 'BUY' | 'SELL', type: OrderType, limitPrice?: number) => number | null;
   getCurrentMarginBudgetUsdt: (symbol: string) => number;
   getMaxLeverage: () => number;
   hardStopLossPct: number;

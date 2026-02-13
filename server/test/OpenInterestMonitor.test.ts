@@ -20,9 +20,9 @@ export function runTests() {
   mon.update(1000);
   assert(received !== null, 'should receive metrics');
   assert(received.openInterest === 1000, 'open interest value');
-  assert(received.delta === 0, 'first delta should be 0');
+  assert(received.oiChangeAbs === 0, 'first delta should be 0');
   // Second update: delta should reflect change
   mon.update(1500);
   assert(received.openInterest === 1500, 'open interest updated');
-  assert(received.delta === 500, 'delta should be difference');
+  assert(received.oiChangeAbs === 500, 'delta should be difference');
 }

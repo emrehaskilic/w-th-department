@@ -13,6 +13,9 @@ function baseConfig(): OrderPlanConfig {
     planEpochMs: 60_000,
     orderPrefix: 'p',
     planRebuildCooldownMs: 0,
+    minMarginUsdt: 5,
+    limitBufferBps: 5,
+    defaultTickSize: 0.1,
     orderPriceTolerancePct: 0.05,
     orderQtyTolerancePct: 1,
     replaceThrottlePerSecond: 10,
@@ -50,6 +53,10 @@ function baseConfig(): OrderPlanConfig {
       levels: 2,
       stepPcts: [0.2, 0.4],
       distribution: [50, 50],
+      reduceOnly: true,
+    },
+    stop: {
+      distancePct: 0.8,
       reduceOnly: true,
     },
     profitLock: {

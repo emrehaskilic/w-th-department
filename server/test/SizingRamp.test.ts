@@ -17,7 +17,7 @@ export function runTests() {
   assert(state.currentMarginBudgetUsdt === 10, 'initial budget should equal starting margin');
 
   state = ramp.onTradeClosed(1);
-  assert(Math.abs(state.currentMarginBudgetUsdt - 11) < 1e-9, 'success should increase budget by 10%');
+  assert(Math.abs(state.currentMarginBudgetUsdt - 12) < 1e-9, 'success should increase budget by asymmetric compounding');
 
   // Push to max clamp (10 * 5 = 50)
   for (let i = 0; i < 30; i++) {

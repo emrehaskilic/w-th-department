@@ -1,10 +1,14 @@
 import { ExecutionConnector } from '../connectors/ExecutionConnector';
+import { OrderType, TimeInForce } from '../connectors/executionTypes';
 
 export interface ExecutionDecision {
     symbol: string;
     side: 'BUY' | 'SELL';
     price: number;
     quantity: number;
+    type?: OrderType;
+    timeInForce?: TimeInForce;
+    stopPrice?: number;
     reduceOnly?: boolean;
 }
 
@@ -24,8 +28,11 @@ export class BinanceExecutor {
             const res = await (this.connector as any).placeOrder({
                 symbol: decision.symbol,
                 side: decision.side,
-                type: 'MARKET',
+                type: decision.type || 'MARKET',
                 quantity: decision.quantity,
+                price: decision.type === 'LIMIT' ? decision.price : undefined,
+                stopPrice: decision.stopPrice,
+                timeInForce: decision.timeInForce,
                 reduceOnly: decision.reduceOnly ? true : undefined,
                 clientOrderId: `bot_${Date.now()}`
             });

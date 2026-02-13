@@ -804,6 +804,7 @@ async function processSymbolEvent(s: string, d: any) {
         const signal = strategy.compute({
             price: p,
             atr: backfill.getState().atr,
+            avgAtr: backfill.getState().avgAtr,
             recentHigh: backfill.getState().recentHigh,
             recentLow: backfill.getState().recentLow,
             obi: legMetrics?.obiDeep || 0,
@@ -985,6 +986,13 @@ function broadcastMetrics(
             prints_per_second: tasMetrics.printsPerSecond,
             best_bid: bestBidPx,
             best_ask: bestAskPx,
+            funding: lastFunding.get(s)
+                ? {
+                    rate: lastFunding.get(s)?.rate ?? null,
+                    timeToFundingMs: lastFunding.get(s)?.timeToFundingMs ?? null,
+                    trend: lastFunding.get(s)?.trend ?? null,
+                }
+                : null,
             legacyMetrics: legacyM ? {
                 obiDeep: legacyM.obiDeep,
                 deltaZ: legacyM.deltaZ,

@@ -5,6 +5,7 @@ import {
   PlanAction,
   OrderRole,
   OrderTag,
+  isMarketLikeOrderType,
   parseClientOrderId,
   isPlanOrder,
 } from './OrderPlan';
@@ -15,6 +16,37 @@ export interface ReconcileConfig {
   qtyTolerancePct: number;
   replaceThrottlePerSecond: number;
   cancelStalePlanOrders: boolean;
+}
+
+export interface ReconciledPosition {
+  side: 'LONG' | 'SHORT';
+  qty: number;
+  entryPrice: number;
+  unrealizedPnl: number;
+}
+
+export async function reconcilePosition(input: {
+  symbol: string;
+  fetchPositionRisk: (symbol: string) => Promise<{ positionAmt: number; entryPrice: number; unRealizedProfit: number } | null>;
+  onLog?: (message: string, detail?: Record<string, any>) => void;
+}): Promise<ReconciledPosition | null> {
+  const position = await input.fetchPositionRisk(input.symbol);
+  if (!position) {
+    return null;
+  }
+
+  const posAmt = Number(position.positionAmt || 0);
+  if (!Number.isFinite(posAmt) || posAmt === 0) {
+    input.onLog?.('RECONCILE_POSITION_FLAT', { symbol: input.symbol });
+    return null;
+  }
+
+  return {
+    side: posAmt > 0 ? 'LONG' : 'SHORT',
+    qty: Math.abs(posAmt),
+    entryPrice: Number(position.entryPrice || 0),
+    unrealizedPnl: Number(position.unRealizedProfit || 0),
+  };
 }
 
 export function reconcileOrders(input: {
@@ -105,7 +137,7 @@ function withinTolerance(existing: OpenOrderState, desired: PlannedOrder, cfg: R
     return false;
   }
 
-  if (desired.type === 'MARKET') {
+  if (isMarketLikeOrderType(desired.type)) {
     return true;
   }
 

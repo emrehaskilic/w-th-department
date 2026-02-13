@@ -1,6 +1,9 @@
-import { Side } from '../connectors/executionTypes';
+import { OrderType, Side, TimeInForce } from '../connectors/executionTypes';
 import { OrderPlanConfig, OrchestratorMetricsInput, SymbolState } from './types';
 import {
+  calculateLimitPrice,
+  getOrderTypeConfig,
+  isMarketLikeOrderType,
   OrderRole,
   OrderTag,
   PlanState,
@@ -25,6 +28,10 @@ export interface PlanTickInput {
   leverage: number;
   currentMarginBudgetUsdt: number;
   startingMarginUsdt: number;
+  freezeActive?: boolean;
+  backoffActive?: boolean;
+  fundingShortBlocked?: boolean;
+  tickSize?: number;
 }
 
 export interface PlanTickResult {
@@ -96,6 +103,11 @@ export class PlanRunner {
     }
 
     const budgetBase = this.resolveInitialBudget(input);
+    const blocked = this.shouldBlockNewPosition({
+      trendState,
+      freezeActive: input.freezeActive ?? state.execQuality.freezeActive,
+      backoffActive: input.backoffActive ?? false,
+    });
     if (this.ctx.planId === null && this.ctx.planState === 'FLATTENED') {
       this.ctx.planState = 'BOOT';
     }
@@ -104,9 +116,17 @@ export class PlanRunner {
       const side = this.pickBootSide(metrics, trendState);
       const bootGateOk = this.bootGateOk(metrics);
       const readyWaitOk = this.readyWaitOk(nowMs);
-      if (side && bootGateOk && readyWaitOk) {
+      const marginOk = this.validateMargin(budgetBase * input.leverage, input.leverage);
+      const fundingBlocked = symbol === 'ETHUSDT' && side === 'SELL' && Boolean(input.fundingShortBlocked);
+      if (!blocked.blocked && side && bootGateOk && readyWaitOk && marginOk && !fundingBlocked) {
         this.startNewPlan(symbol, side, trendState, budgetBase, nowMs);
         events.push({ type: 'PLAN_STARTED', detail: { planId: this.ctx.planId, side } });
+      } else if (blocked.blocked) {
+        events.push({ type: blocked.reason || 'NEW_POSITION_BLOCKED' });
+      } else if (!marginOk) {
+        events.push({ type: 'MIN_MARGIN_BLOCKED' });
+      } else if (fundingBlocked) {
+        events.push({ type: 'FUNDING_RATE_UNFAVORABLE_ETH_SHORT' });
       }
     }
 
@@ -376,14 +396,22 @@ export class PlanRunner {
     }
 
     const base = Math.max(1, this.ctx.budgetUsdt || 1);
-    const peak = this.ctx.peakUpnl;
-    const drawdown = peak - upnl;
-    const drawdownR = drawdown / base;
-    const lockTriggered = (peak >= this.config.profitLock.lockTriggerUsdt) ||
-      (peak / base >= this.config.profitLock.lockTriggerR);
-    if (lockTriggered && (drawdown >= this.config.profitLock.maxDdFromPeakUsdt || drawdownR >= this.config.profitLock.maxDdFromPeakR)) {
+    const profitLockState = {
+      activated: this.ctx.profitLockTriggered,
+      peakUpnlR: this.ctx.peakUpnl / base,
+    };
+    const shouldFlattenForProfitLock = this.checkProfitLock(upnl, upnl / base, profitLockState);
+    this.ctx.profitLockTriggered = profitLockState.activated;
+    this.ctx.peakUpnl = Math.max(this.ctx.peakUpnl, profitLockState.peakUpnlR * base);
+    if (shouldFlattenForProfitLock.shouldFlatten) {
       this.ctx.profitLockTriggered = true;
-      events.push({ type: 'PROFIT_LOCK_TRIGGERED', detail: { drawdown, peak } });
+      events.push({
+        type: 'PROFIT_LOCK_TRIGGERED',
+        detail: {
+          drawdown: this.ctx.peakUpnl - upnl,
+          peak: this.ctx.peakUpnl,
+        },
+      });
       return 'PROFIT_LOCK_TRIGGERED';
     }
 
@@ -417,23 +445,27 @@ export class PlanRunner {
 
     if (this.ctx.planState === 'BUILDING' || this.ctx.planState === 'BOOT') {
       const bootGateOk = this.bootGateOk(input.metrics);
-      if (this.config.boot.allowMarket && bootGateOk) {
+      if (bootGateOk) {
         const shouldAttempt = this.shouldAttemptBoot(input.nowMs);
         if (shouldAttempt) {
           const price = this.resolveMarketPrice(input.metrics, this.ctx.side);
-          const qty = this.qtyFromBudget(this.ctx.budgetUsdt * this.config.boot.probeMarketPct, price, input.leverage);
-          if (qty > 0 && price > 0) {
+          const limitPrice = calculateLimitPrice(
+            price,
+            this.ctx.side,
+            input.tickSize || this.config.defaultTickSize || 0.01,
+            this.config.limitBufferBps
+          );
+          const qty = this.qtyFromBudget(this.ctx.budgetUsdt * this.config.boot.probeMarketPct, limitPrice, input.leverage);
+          if (qty > 0 && limitPrice > 0 && this.validateMargin(limitPrice * qty, input.leverage)) {
             immediate.push(this.makeOrder({
               symbol,
               side: this.ctx.side,
-              type: 'MARKET',
               role: 'BOOT_PROBE',
               levelIndex: 0,
-              price,
+              price: limitPrice,
               qty,
-              reduceOnly: false,
             }));
-            events.push({ type: 'BOOT_PROBE_ENTRY', detail: { side: this.ctx.side, qty } });
+            events.push({ type: 'BOOT_PROBE_ENTRY', detail: { side: this.ctx.side, qty, price: limitPrice, type: 'LIMIT' } });
             this.ctx.bootAttemptAtMs = input.nowMs;
           }
         }
@@ -449,12 +481,10 @@ export class PlanRunner {
           immediate.push(this.makeOrder({
             symbol,
             side,
-            type: 'MARKET',
             role: 'FLATTEN',
             levelIndex: 0,
             price,
             qty: position.qty,
-            reduceOnly: true,
           }));
           this.ctx.exitAttemptAtMs = nowMs;
         }
@@ -483,7 +513,7 @@ export class PlanRunner {
 
     if (this.ctx.planState !== 'EXITING') {
       const remainingBudget = this.remainingBudget(position, midPrice, leverage);
-      if (remainingBudget > 0) {
+      if (remainingBudget > 0 && this.validateMargin(remainingBudget * leverage, leverage)) {
         const scaleIn = this.buildScaleInOrders({
           symbol,
           side: this.ctx.side,
@@ -500,6 +530,10 @@ export class PlanRunner {
     }
 
     if (position) {
+      const stopOrder = this.buildStopOrder(symbol, position);
+      if (stopOrder) {
+        desired.push(stopOrder);
+      }
       const tpOrders = this.buildTpOrders(symbol, position);
       desired.push(...tpOrders);
     }
@@ -583,15 +617,16 @@ export class PlanRunner {
       if (qty <= 0 || price <= 0) {
         continue;
       }
+      if (!this.validateMargin(price * qty, input.leverage)) {
+        continue;
+      }
       orders.push(this.makeOrder({
         symbol: input.symbol,
         side: input.side,
-        type: 'LIMIT',
         role: 'SCALE_IN',
         levelIndex: i,
         price,
         qty,
-        reduceOnly: false,
       }));
     }
 
@@ -618,15 +653,34 @@ export class PlanRunner {
       orders.push(this.makeOrder({
         symbol,
         side,
-        type: 'LIMIT',
         role: 'TP',
         levelIndex: i,
         price,
         qty,
-        reduceOnly: this.config.tp.reduceOnly,
       }));
     }
     return orders;
+  }
+
+  private buildStopOrder(symbol: string, position: NonNullable<SymbolState['position']>): PlannedOrder | null {
+    const distPct = Math.max(0.01, this.config.stop.distancePct);
+    const side: Side = position.side === 'LONG' ? 'SELL' : 'BUY';
+    const stopPrice = position.side === 'LONG'
+      ? position.entryPrice * (1 - distPct / 100)
+      : position.entryPrice * (1 + distPct / 100);
+    if (!(stopPrice > 0) || !(position.qty > 0)) {
+      return null;
+    }
+    return this.makeOrder({
+      symbol,
+      side,
+      role: 'STOP',
+      levelIndex: 0,
+      price: stopPrice,
+      stopPrice,
+      qty: position.qty,
+      reduceOnly: this.config.stop.reduceOnly,
+    });
   }
 
   private buildExitOrder(symbol: string, position: NonNullable<SymbolState['position']>, metrics: OrchestratorMetricsInput): PlannedOrder | null {
@@ -642,12 +696,10 @@ export class PlanRunner {
       return this.makeOrder({
         symbol,
         side,
-        type: 'MARKET',
         role: 'FLATTEN',
         levelIndex: 0,
         price,
         qty: position.qty,
-        reduceOnly: true,
       });
     }
 
@@ -659,25 +711,30 @@ export class PlanRunner {
     return this.makeOrder({
       symbol,
       side,
-      type: 'LIMIT',
       role: 'FLATTEN',
       levelIndex: 0,
       price,
       qty: position.qty,
-      reduceOnly: true,
+      type: 'LIMIT',
     });
   }
 
   private makeOrder(input: {
     symbol: string;
     side: Side;
-    type: 'MARKET' | 'LIMIT';
     role: OrderRole;
     levelIndex: number;
     price: number;
+    stopPrice?: number;
     qty: number;
-    reduceOnly: boolean;
+    type?: OrderType;
+    timeInForce?: TimeInForce;
+    reduceOnly?: boolean;
   }): PlannedOrder {
+    const roleConfig = getOrderTypeConfig(input.role);
+    const type = input.type || roleConfig.orderType;
+    const timeInForce = input.timeInForce || roleConfig.timeInForce;
+    const reduceOnly = typeof input.reduceOnly === 'boolean' ? input.reduceOnly : roleConfig.reduceOnly;
     const tag: OrderTag = {
       planId: this.ctx.planId || 'na',
       role: input.role,
@@ -692,10 +749,14 @@ export class PlanRunner {
       levelIndex: input.levelIndex,
       symbol: input.symbol,
       side: input.side,
-      type: input.type,
-      price: input.type === 'MARKET' ? null : input.price,
+      type,
+      timeInForce,
+      price: isMarketLikeOrderType(type) ? null : input.price,
+      stopPrice: type === 'STOP_MARKET' || type === 'TAKE_PROFIT_MARKET'
+        ? (typeof input.stopPrice === 'number' ? input.stopPrice : input.price)
+        : null,
       qty: input.qty,
-      reduceOnly: input.reduceOnly,
+      reduceOnly,
       clientOrderId,
       tag,
     };
@@ -747,6 +808,55 @@ export class PlanRunner {
     }
     const equal = Array.from({ length: levels }, () => 100 / levels);
     return normalizePercentages(equal);
+  }
+
+  private shouldBlockNewPosition(input: {
+    trendState: TrendState;
+    freezeActive: boolean;
+    backoffActive: boolean;
+  }): { blocked: boolean; reason?: string } {
+    if (input.trendState === 'CHOP') {
+      return { blocked: true, reason: 'CHOP_MARKET_NO_NEW_POSITIONS' };
+    }
+    if (input.freezeActive) {
+      return { blocked: true, reason: 'EXECUTION_FROZEN' };
+    }
+    if (input.backoffActive) {
+      return { blocked: true, reason: 'RATE_LIMIT_BACKOFF' };
+    }
+    return { blocked: false };
+  }
+
+  private validateMargin(notional: number, leverage: number): boolean {
+    if (!Number.isFinite(notional) || notional <= 0 || !Number.isFinite(leverage) || leverage <= 0) {
+      return false;
+    }
+    const margin = notional / leverage;
+    return margin >= this.config.minMarginUsdt;
+  }
+
+  private checkProfitLock(
+    upnlUsdt: number,
+    upnlR: number,
+    state: { activated: boolean; peakUpnlR: number }
+  ): { shouldFlatten: boolean } {
+    const shouldActivateByUsdt = this.config.profitLock.lockTriggerUsdt > 0 && upnlUsdt >= this.config.profitLock.lockTriggerUsdt;
+    const shouldActivateByR = this.config.profitLock.lockTriggerR > 0 && upnlR >= this.config.profitLock.lockTriggerR;
+    if (!state.activated && (shouldActivateByUsdt || shouldActivateByR)) {
+      state.activated = true;
+      state.peakUpnlR = upnlR;
+    }
+
+    if (state.activated) {
+      if (upnlR > state.peakUpnlR) {
+        state.peakUpnlR = upnlR;
+      }
+      if (state.peakUpnlR - upnlR >= this.config.profitLock.maxDdFromPeakR) {
+        return { shouldFlatten: true };
+      }
+    }
+
+    return { shouldFlatten: false };
   }
 
   private buildSummary(

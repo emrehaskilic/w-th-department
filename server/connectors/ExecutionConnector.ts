@@ -52,6 +52,15 @@ interface SignedRequestOptions {
   orderAttemptId?: string;
 }
 
+const RATE_LIMIT_WEIGHT_PER_MINUTE = 1200;
+const SAFE_WEIGHT_LIMIT = 1000;
+
+interface RateLimitState {
+  weightUsed: number;
+  lastResetMs: number;
+  backoffUntilMs: number;
+}
+
 export type ExecutionConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
 
 export interface ExecutionConnectorStatus {
@@ -64,6 +73,8 @@ export interface ExecutionConnectorStatus {
   readyReason: string | null;
   serverTimeOffsetMs: number;
   dualSidePosition: boolean | null;
+  rateLimitWeightUsed: number;
+  rateLimitBackoffUntilMs: number;
   updatedAtMs: number;
 }
 
@@ -113,6 +124,11 @@ export class ExecutionConnector {
   private preferredLeverage: number;
   private walletBalance = 0;
   private availableBalance = 0;
+  private readonly rateLimitState: RateLimitState = {
+    weightUsed: 0,
+    lastResetMs: Date.now(),
+    backoffUntilMs: 0,
+  };
 
   constructor(config: ExecutionConnectorConfig) {
     this.config = config;
@@ -140,16 +156,21 @@ export class ExecutionConnector {
 
   getStatus(): ExecutionConnectorStatus {
     const readiness = this.aggregateReadiness();
+    const backoffActive = this.isRateLimitBackoffActive();
+    const ready = readiness.ready && !backoffActive;
+    const readyReason = backoffActive ? 'rate_limit_backoff' : readiness.reason;
     return {
       state: this.state,
       executionEnabled: this.executionEnabled,
       hasCredentials: Boolean(this.apiKey && this.apiSecret),
       symbols: Array.from(this.symbols),
       lastError: this.lastError,
-      ready: readiness.ready,
-      readyReason: readiness.reason,
+      ready,
+      readyReason,
       serverTimeOffsetMs: this.serverTimeOffsetMs,
       dualSidePosition: this.dualSidePosition,
+      rateLimitWeightUsed: this.rateLimitState.weightUsed,
+      rateLimitBackoffUntilMs: this.rateLimitState.backoffUntilMs,
       updatedAtMs: Date.now(),
     };
   }
@@ -185,6 +206,14 @@ export class ExecutionConnector {
 
   getAvailableBalance(): number {
     return this.availableBalance;
+  }
+
+  isRateLimitBackoffActive(nowMs: number = Date.now()): boolean {
+    return nowMs < this.rateLimitState.backoffUntilMs;
+  }
+
+  getRateLimitBackoffRemainingMs(nowMs: number = Date.now()): number {
+    return Math.max(0, this.rateLimitState.backoffUntilMs - nowMs);
   }
 
   setCredentials(apiKey: string, apiSecret: string) {
@@ -348,7 +377,12 @@ export class ExecutionConnector {
     this.emitStatus();
   }
 
-  expectedPrice(symbol: string, side: 'BUY' | 'SELL', orderType: 'MARKET' | 'LIMIT', limitPrice?: number): number | null {
+  expectedPrice(
+    symbol: string,
+    side: 'BUY' | 'SELL',
+    orderType: 'MARKET' | 'LIMIT' | 'STOP_MARKET' | 'TAKE_PROFIT_MARKET',
+    limitPrice?: number
+  ): number | null {
     if (orderType === 'LIMIT') {
       return typeof limitPrice === 'number' ? limitPrice : null;
     }
@@ -403,6 +437,19 @@ export class ExecutionConnector {
       });
       throw new Error('Execution connector is not connected');
     }
+    if (this.isRateLimitBackoffActive()) {
+      const remainingMs = this.getRateLimitBackoffRemainingMs();
+      this.emitDebug({
+        channel: 'execution',
+        type: 'why_not_sent',
+        order_attempt_id: orderAttemptId,
+        decision_id: context?.decisionId,
+        symbol: request.symbol,
+        ts: Date.now(),
+        payload: { why_not_sent: 'rate_limit_backoff', remainingMs },
+      });
+      throw new Error(`rate_limit_backoff:${remainingMs}`);
+    }
 
     const symbol = request.symbol.toUpperCase();
     const readiness = this.readyBySymbol.get(symbol);
@@ -425,7 +472,7 @@ export class ExecutionConnector {
       orderAttemptId,
       decisionId: context?.decisionId,
     });
-    const orderType = request.type === 'LIMIT' ? 'LIMIT' : 'MARKET';
+    const orderType = request.type;
 
     const params: Record<string, string | number | boolean | undefined> = {
       symbol,
@@ -449,7 +496,18 @@ export class ExecutionConnector {
 
       const normalizedLimitPrice = this.normalizeLimitPrice(symbol, request.side, rawLimitPrice);
       params.price = normalizedLimitPrice;
-      params.timeInForce = 'GTC';
+      params.timeInForce = request.timeInForce || 'GTC';
+    }
+
+    if (orderType === 'STOP_MARKET' || orderType === 'TAKE_PROFIT_MARKET') {
+      let rawStopPrice = Number(request.stopPrice ?? request.price);
+      if (!Number.isFinite(rawStopPrice) || rawStopPrice <= 0) {
+        rawStopPrice = await this.referencePrice(symbol, request.side);
+      }
+      if (!Number.isFinite(rawStopPrice) || rawStopPrice <= 0) {
+        throw new Error(`invalid_stop_price:${request.stopPrice}`);
+      }
+      params.stopPrice = this.normalizeLimitPrice(symbol, request.side, rawStopPrice);
     }
 
     this.emitDebug({
@@ -545,6 +603,52 @@ export class ExecutionConnector {
       },
       requiresAuth: true,
     });
+  }
+
+  async queryOrder(symbol: string, orderId: string): Promise<{ status: string; executedQty: number }> {
+    if (!this.apiKey || !this.apiSecret) {
+      throw new Error('Execution keys are missing');
+    }
+
+    const response = await this.signedRequest({
+      path: '/fapi/v1/order',
+      method: 'GET',
+      requiresAuth: true,
+      params: {
+        symbol: symbol.toUpperCase(),
+        orderId,
+        recvWindow: Math.trunc(this.config.recvWindowMs || 5000),
+      },
+    });
+
+    return {
+      status: String(response?.status || ''),
+      executedQty: Number(response?.executedQty || 0),
+    };
+  }
+
+  async fetchPositionRisk(symbol: string): Promise<{ positionAmt: number; entryPrice: number; unRealizedProfit: number } | null> {
+    if (!this.apiKey || !this.apiSecret) {
+      return null;
+    }
+
+    const response = await this.signedRequest({
+      path: '/fapi/v2/positionRisk',
+      method: 'GET',
+      requiresAuth: true,
+      params: { symbol: symbol.toUpperCase() },
+    });
+
+    const row = Array.isArray(response) ? response[0] : response;
+    if (!row) {
+      return null;
+    }
+
+    return {
+      positionAmt: Number(row.positionAmt || 0),
+      entryPrice: Number(row.entryPrice || 0),
+      unRealizedProfit: Number(row.unRealizedProfit || 0),
+    };
   }
 
   async syncState(): Promise<void> {
@@ -1285,11 +1389,66 @@ export class ExecutionConnector {
     return out;
   }
 
+  private checkRateLimit(nowMs: number = Date.now()): boolean {
+    if (nowMs - this.rateLimitState.lastResetMs > 60_000) {
+      this.rateLimitState.weightUsed = 0;
+      this.rateLimitState.lastResetMs = nowMs;
+    }
+
+    if (nowMs < this.rateLimitState.backoffUntilMs) {
+      return false;
+    }
+
+    const safeLimit = Math.min(SAFE_WEIGHT_LIMIT, RATE_LIMIT_WEIGHT_PER_MINUTE);
+    if (this.rateLimitState.weightUsed >= safeLimit) {
+      const waitMs = Math.max(0, 60_000 - (nowMs - this.rateLimitState.lastResetMs));
+      this.rateLimitState.backoffUntilMs = nowMs + waitMs;
+      this.emitStatus();
+      return false;
+    }
+
+    return true;
+  }
+
+  private handleRateLimitError(retryAfterMs: number) {
+    this.rateLimitState.backoffUntilMs = Date.now() + Math.max(retryAfterMs, 60_000);
+    this.emitStatus();
+  }
+
+  private readRetryAfterMs(response: Response): number {
+    const retryAfterRaw = response.headers.get('retry-after');
+    if (!retryAfterRaw) {
+      return 60_000;
+    }
+    const retryAfterSeconds = Number(retryAfterRaw);
+    if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds <= 0) {
+      return 60_000;
+    }
+    return Math.round(retryAfterSeconds * 1000);
+  }
+
+  private updateRateLimitFromHeaders(response: Response) {
+    const usedWeight1mHeader = response.headers.get('x-mbx-used-weight-1m');
+    const parsed = Number(usedWeight1mHeader);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      this.rateLimitState.weightUsed = parsed;
+      return;
+    }
+    this.rateLimitState.weightUsed += 1;
+  }
+
   private async signedRequest(options: SignedRequestOptions): Promise<any> {
     const apiKey = this.apiKey;
     const secret = this.apiSecret;
     if (!apiKey || !secret) {
       throw new Error('Execution connector is missing API keys');
+    }
+    if (!this.checkRateLimit()) {
+      const remainingMs = this.getRateLimitBackoffRemainingMs();
+      const err: any = new Error(`rate_limit_backoff:${remainingMs}`);
+      err.httpStatus = 429;
+      err.binanceCode = -1003;
+      throw err;
     }
 
     const params = this.sanitizeParams(options.params);
@@ -1354,6 +1513,9 @@ export class ExecutionConnector {
     }
 
     if (!response.ok) {
+      if (response.status === 429) {
+        this.handleRateLimitError(this.readRetryAfterMs(response));
+      }
       const codeRaw = body?.code;
       const binanceCode = typeof codeRaw === 'number'
         ? codeRaw
@@ -1382,11 +1544,16 @@ export class ExecutionConnector {
       throw err;
     }
 
+    this.updateRateLimitFromHeaders(response);
+
     return body;
   }
 
   private classifyBinanceError(error: any): string {
+    const httpStatus = Number(error?.httpStatus);
+    if (httpStatus === 429) return 'rate_limit_429';
     const code = Number(error?.binanceCode);
+    if (code === -1003) return 'rate_limit_backoff';
     if (code === -1021) return 'timestamp_out_of_window';
     if (code === -1022) return 'invalid_signature';
     if (code === -2015) return 'invalid_key_or_permissions';

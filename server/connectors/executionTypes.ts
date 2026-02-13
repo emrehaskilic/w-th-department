@@ -1,6 +1,7 @@
 export type Side = 'BUY' | 'SELL';
 export type PositionSide = 'LONG' | 'SHORT';
-export type OrderType = 'MARKET' | 'LIMIT';
+export type OrderType = 'MARKET' | 'LIMIT' | 'STOP_MARKET' | 'TAKE_PROFIT_MARKET';
+export type TimeInForce = 'GTC' | 'IOC' | 'FOK';
 export type MarginType = 'ISOLATED' | 'CROSSED';
 
 export interface TestnetQuote {
@@ -96,6 +97,8 @@ export interface PlaceOrderRequest {
   type: OrderType;
   quantity: number;
   price?: number;
+  stopPrice?: number;
+  timeInForce?: TimeInForce;
   reduceOnly?: boolean;
   positionSide?: 'LONG' | 'SHORT' | 'BOTH';
   clientOrderId: string;

@@ -1,14 +1,18 @@
 import * as path from 'path';
 import { ExecutionConnector } from '../connectors/ExecutionConnector';
-import { ExecutionEvent } from '../connectors/executionTypes';
+import { ExecutionEvent, Side } from '../connectors/executionTypes';
 import { BinanceExecutor } from '../execution/BinanceExecutor';
+import { TradeLogger } from '../logger/TradeLogger';
+import { FundingRateMonitor } from '../metrics/FundingRateMonitor';
 import { RiskManager } from '../risk/RiskManager';
 import { SymbolActor } from './Actor';
 import { DecisionEngine } from './Decision';
 import { runGate } from './Gate';
 import { OrchestratorLogger } from './Logger';
 import { PlannedOrder } from './OrderPlan';
+import { OrderMonitor } from './OrderMonitor';
 import { PlanRunner, PlanTickResult } from './PlanRunner';
+import { reconcilePosition } from './Reconciler';
 import { SizingRamp } from './SizingRamp';
 import {
   DecisionAction,
@@ -45,6 +49,13 @@ export class Orchestrator {
   private readonly stateSnapshots = new Map<string, SymbolState>();
   private readonly executor: BinanceExecutor;
   private readonly logger: OrchestratorLogger;
+  private readonly orderMonitor: OrderMonitor;
+  private readonly tradeLogger: TradeLogger;
+  private readonly fundingRateMonitor = new FundingRateMonitor();
+  private readonly fundingLastUpdateBySymbol = new Map<string, number>();
+  private readonly fundingRefreshMs = Number(process.env.FUNDING_REFRESH_MS || 60_000);
+  private readonly limitTimeoutMs = Number(process.env.LIMIT_ORDER_TIMEOUT_MS || 30_000);
+  private orderMonitorTimer: NodeJS.Timeout | null = null;
 
   private killSwitch = false;
   private replayMode = false;
@@ -73,10 +84,26 @@ export class Orchestrator {
       },
     });
 
+    this.tradeLogger = new TradeLogger(path.join(process.cwd(), 'logs', 'trades.jsonl'));
+    this.orderMonitor = new OrderMonitor({
+      queryOrder: (symbol, orderId) => this.connector.queryOrder(symbol, orderId),
+      cancelOrder: (symbol, orderId, clientOrderId) => this.connector.cancelOrder({ symbol, orderId, clientOrderId }),
+      placeMarketOrder: async (fallback) => {
+        await this.placeMarketFallbackOrder(fallback);
+      },
+      log: (event, detail) => this.log(event, detail || {}),
+    });
+
     this.connector.onExecutionEvent((event) => {
       if (event.type === 'TRADE_UPDATE') {
         const prev = this.realizedPnlBySymbol.get(event.symbol) || 0;
         this.realizedPnlBySymbol.set(event.symbol, prev + event.realizedPnl);
+      }
+      if (event.type === 'ORDER_UPDATE') {
+        const terminal = event.status === 'FILLED' || event.status === 'CANCELED' || event.status === 'REJECTED' || event.status === 'EXPIRED';
+        if (terminal) {
+          this.orderMonitor.remove(event.orderId);
+        }
       }
       this.ingestExecutionEvent(event);
     });
@@ -89,6 +116,13 @@ export class Orchestrator {
   async start() {
     this.replayMode = false;
     await this.connector.start();
+    if (!this.orderMonitorTimer) {
+      this.orderMonitorTimer = setInterval(() => {
+        this.orderMonitor.monitorLimitOrders().catch((e: any) => {
+          this.log('LIMIT_MONITOR_LOOP_ERROR', { error: e?.message || 'monitor_failed' });
+        });
+      }, 1_000);
+    }
   }
 
   setKillSwitch(enabled: boolean) {
@@ -97,6 +131,7 @@ export class Orchestrator {
 
   ingest(metrics: OrchestratorMetricsInput) {
     const symbol = metrics.symbol.toUpperCase();
+    this.refreshFundingIfNeeded(symbol);
     this.connector.ensureSymbol(symbol);
     const envelope = this.buildMetricsEnvelope(symbol, metrics);
     this.logger.logMetrics({
@@ -251,6 +286,10 @@ export class Orchestrator {
 
   async disconnectExecution() {
     await this.connector.disconnect();
+    if (this.orderMonitorTimer) {
+      clearInterval(this.orderMonitorTimer);
+      this.orderMonitorTimer = null;
+    }
   }
 
   async refreshExecutionState() {
@@ -294,6 +333,26 @@ export class Orchestrator {
       event,
       ...data
     }));
+  }
+
+  private refreshFundingIfNeeded(symbol: string) {
+    const normalized = symbol.toUpperCase();
+    const now = Date.now();
+    const last = this.fundingLastUpdateBySymbol.get(normalized) || 0;
+    if (now - last < this.fundingRefreshMs) {
+      return;
+    }
+    this.fundingLastUpdateBySymbol.set(normalized, now);
+    this.fundingRateMonitor.updateFundingRate(normalized).catch((e: any) => {
+      this.log('FUNDING_UPDATE_ERROR', { symbol: normalized, error: e?.message || 'funding_update_failed' });
+    });
+  }
+
+  private isFundingShortBlocked(symbol: string): boolean {
+    if (symbol.toUpperCase() !== 'ETHUSDT') {
+      return false;
+    }
+    return this.fundingRateMonitor.isShortBlocked(symbol);
   }
 
   private buildMetricsEnvelope(symbol: string, metrics: OrchestratorMetricsInput): MetricsEventEnvelope {
@@ -385,7 +444,9 @@ export class Orchestrator {
       getRampMult: () => this.getRampMult(normalized),
       getEffectiveLeverage: () => this.getEffectiveLeverage(),
       getExecutionReady: () => this.getExecutionGateState().ready,
-      onPositionClosed: (realizedPnl) => this.onPositionClosed(normalized, realizedPnl),
+      getBackoffActive: () => this.connector.isRateLimitBackoffActive(),
+      getFundingShortBlocked: () => this.isFundingShortBlocked(normalized),
+      onPositionClosed: (close) => this.onPositionClosed(normalized, close),
       markAddUsed: () => {},
       cooldownConfig: this.config.cooldown,
     });
@@ -431,7 +492,17 @@ export class Orchestrator {
     if (existing) {
       return existing;
     }
-    const manager = new RiskManager();
+    const manager = new RiskManager({
+      maxPositionNotionalUsdt: 500,
+      cooldownMs: 10_000,
+      maxSlippagePct: 0.1,
+      circuitBreaker: {
+        maxConsecutiveLosses: Number(process.env.CB_MAX_CONSEC_LOSSES || 3),
+        maxDailyDrawdownPct: Number(process.env.CB_MAX_DAILY_DRAWDOWN_PCT || 0.15),
+        pauseDurationMs: Number(process.env.CB_PAUSE_MS || 30 * 60 * 1000),
+      },
+      onAlert: (message) => this.log('CIRCUIT_BREAKER_ALERT', { symbol: normalized, message }),
+    });
     this.riskManagers.set(normalized, manager);
     return manager;
   }
@@ -468,9 +539,68 @@ export class Orchestrator {
     return Math.min(this.capitalSettings.leverage, this.config.maxLeverage);
   }
 
-  private onPositionClosed(symbol: string, realizedPnl: number) {
+  private onPositionClosed(symbol: string, close: {
+    realizedPnl: number;
+    side: 'LONG' | 'SHORT';
+    qty: number;
+    entryPrice: number;
+    exitPrice: number;
+    openTimeMs: number;
+    closeTimeMs: number;
+    reason?: string;
+    signalType?: string;
+    orderflow?: {
+      obiWeighted?: number | null;
+      obiDeep?: number | null;
+      deltaZ?: number | null;
+      cvdSlope?: number | null;
+    };
+  }) {
     const ramp = this.ensureRamp(symbol);
-    ramp.onTradeClosed(realizedPnl);
+    ramp.onTradeClosed(close.realizedPnl);
+    this.getRiskManager(symbol).recordTradeClosed(close.realizedPnl, this.connector.getWalletBalance() || 0);
+
+    const leverage = this.getEffectiveLeverage();
+    const notional = close.entryPrice * close.qty;
+    const margin = leverage > 0 ? notional / leverage : notional;
+    const feeRate = this.config.takerFeeBps / 10_000;
+    const feeUsdt = (notional + Math.abs(close.exitPrice * close.qty)) * feeRate;
+    const netUsdt = close.realizedPnl - feeUsdt;
+    const baseMargin = this.getStartingMarginUsdt(symbol);
+    const rMultiple = baseMargin > 0 ? netUsdt / baseMargin : null;
+
+    this.tradeLogger.append({
+      tradeId: `${symbol}-${close.closeTimeMs}`,
+      symbol,
+      side: close.side,
+      signalType: close.signalType || 'UNKNOWN',
+      openTime: new Date(close.openTimeMs).toISOString(),
+      closeTime: new Date(close.closeTimeMs).toISOString(),
+      entry: {
+        price: close.entryPrice,
+        qty: close.qty,
+        notional,
+        margin,
+        leverage,
+      },
+      exit: {
+        price: close.exitPrice,
+        reason: close.reason || 'POSITION_CLOSED',
+        qty: close.qty,
+      },
+      orderflow: {
+        obiWeighted: close.orderflow?.obiWeighted ?? null,
+        obiDeep: close.orderflow?.obiDeep ?? null,
+        deltaZ: close.orderflow?.deltaZ ?? null,
+        cvdSlope: close.orderflow?.cvdSlope ?? null,
+      },
+      pnl: {
+        grossUsdt: close.realizedPnl,
+        feeUsdt,
+        netUsdt,
+        rMultiple,
+      },
+    });
   }
 
   private getExecutionGateState() {
@@ -561,16 +691,33 @@ export class Orchestrator {
   }
 
   private async executePlannedOrder(order: PlannedOrder) {
-    const side = order.side;
+    let side = order.side;
     const leverage = this.getEffectiveLeverage();
     const marginBudget = this.getCurrentMarginBudgetUsdt(order.symbol);
     const bufferBps = 0;
+
+    if (order.role === 'FLATTEN') {
+      const actualPosition = await reconcilePosition({
+        symbol: order.symbol,
+        fetchPositionRisk: (symbol) => this.connector.fetchPositionRisk(symbol),
+        onLog: (message, detail) => this.log(message, detail || {}),
+      });
+      if (!actualPosition) {
+        return;
+      }
+      side = actualPosition.side === 'LONG' ? 'SELL' : 'BUY';
+      order = {
+        ...order,
+        side,
+        qty: Math.min(order.qty, actualPosition.qty),
+      };
+    }
 
     let price = 0;
     if (order.type === 'LIMIT') {
       price = typeof order.price === 'number' && Number.isFinite(order.price) ? order.price : 0;
     } else {
-      const expected = this.connector.expectedPrice(order.symbol, side, 'MARKET');
+      const expected = this.connector.expectedPrice(order.symbol, side, order.type, order.price ?? undefined);
       price = typeof expected === 'number' && Number.isFinite(expected) ? expected : (order.price || 0);
     }
 
@@ -671,6 +818,8 @@ export class Orchestrator {
         type: order.type,
         quantity: sizingQty,
         price: order.type === 'LIMIT' ? sizingPrice : undefined,
+        stopPrice: order.stopPrice || undefined,
+        timeInForce: order.timeInForce,
         reduceOnly: order.reduceOnly,
         clientOrderId: order.clientOrderId,
       });
@@ -691,6 +840,19 @@ export class Orchestrator {
           sentAtMs: Date.now(),
           tag,
         });
+        if (order.type === 'LIMIT' && (order.role === 'BOOT_PROBE' || order.role === 'SCALE_IN' || order.role === 'TP')) {
+          this.orderMonitor.register({
+            orderId: res.orderId,
+            clientOrderId: order.clientOrderId,
+            symbol: order.symbol,
+            side,
+            price: sizingPrice,
+            qty: sizingQty,
+            reduceOnly: order.reduceOnly,
+            role: order.role,
+            timeoutMs: this.limitTimeoutMs,
+          });
+        }
       }
       if (!order.reduceOnly) {
         this.getRiskManager(order.symbol).recordTrade(order.symbol);
@@ -707,6 +869,47 @@ export class Orchestrator {
     }
   }
 
+  private async placeMarketFallbackOrder(input: {
+    symbol: string;
+    side: Side;
+    qty: number;
+    reduceOnly: boolean;
+    role: PlannedOrder['role'];
+    fallbackFromOrderId: string;
+  }) {
+    if (!(input.qty > 0)) {
+      return;
+    }
+    try {
+      await this.connector.placeOrder({
+        symbol: input.symbol,
+        side: input.side,
+        type: 'MARKET',
+        quantity: input.qty,
+        reduceOnly: input.reduceOnly,
+        clientOrderId: `to_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
+      });
+      this.log('LIMIT_TIMEOUT_FALLBACK_SENT', {
+        symbol: input.symbol,
+        side: input.side,
+        qty: input.qty,
+        reduceOnly: input.reduceOnly,
+        role: input.role,
+        fallbackFromOrderId: input.fallbackFromOrderId,
+      });
+    } catch (e: any) {
+      this.log('LIMIT_TIMEOUT_FALLBACK_ERROR', {
+        symbol: input.symbol,
+        side: input.side,
+        qty: input.qty,
+        reduceOnly: input.reduceOnly,
+        role: input.role,
+        fallbackFromOrderId: input.fallbackFromOrderId,
+        error: e?.message || 'fallback_failed',
+      });
+    }
+  }
+
   private async cancelPlannedOrder(symbol: string, order: { orderId?: string; clientOrderId?: string }): Promise<boolean> {
     try {
       await this.connector.cancelOrder({
@@ -714,6 +917,9 @@ export class Orchestrator {
         orderId: order.orderId,
         clientOrderId: order.clientOrderId,
       });
+      if (order.orderId) {
+        this.orderMonitor.remove(order.orderId);
+      }
       return true;
     } catch (e: any) {
       this.log('EXECUTION_CANCEL_ERROR', { symbol, error: e?.message || 'cancel_failed' });
@@ -922,10 +1128,13 @@ export function createOrchestratorFromEnv(): Orchestrator {
     dualSidePosition: String(process.env.POSITION_MODE || 'ONE-WAY').toUpperCase() === 'HEDGE',
   });
 
-  const planConfig = {
+  const planConfig: OrchestratorConfig['plan'] = {
     planEpochMs: Number(process.env.PLAN_EPOCH_MS || 60_000),
     orderPrefix: String(process.env.PLAN_ORDER_PREFIX || 'p'),
     planRebuildCooldownMs: Number(process.env.PLAN_REBUILD_COOLDOWN_MS || 2000),
+    minMarginUsdt: Number(process.env.MIN_MARGIN_USDT || 50),
+    limitBufferBps: Number(process.env.LIMIT_BUFFER_BPS || 5),
+    defaultTickSize: Number(process.env.DEFAULT_TICK_SIZE || 0.01),
     orderPriceTolerancePct: Number(process.env.PLAN_PRICE_TOL_PCT || 0.05),
     orderQtyTolerancePct: Number(process.env.PLAN_QTY_TOL_PCT || 1),
     replaceThrottlePerSecond: Number(process.env.PLAN_REPLACE_THROTTLE_PER_SEC || 5),
@@ -936,7 +1145,7 @@ export function createOrchestratorFromEnv(): Orchestrator {
       maxSpreadPct: Number(process.env.BOOT_MAX_SPREAD_PCT || 0.12),
       minObiDeep: Number(process.env.BOOT_MIN_OBI_DEEP || 0.03),
       minDeltaZ: Number(process.env.BOOT_MIN_DELTA_Z || 0.15),
-      allowMarket: parseEnvFlag(process.env.BOOT_ALLOW_MARKET ?? 'true'),
+      allowMarket: parseEnvFlag(process.env.BOOT_ALLOW_MARKET ?? 'false'),
       retryMs: Number(process.env.BOOT_RETRY_MS || 5000),
     },
     trend: {
@@ -965,11 +1174,15 @@ export function createOrchestratorFromEnv(): Orchestrator {
       distribution: parseNumberList(process.env.TP_DISTRIBUTION || '40,35,25'),
       reduceOnly: parseEnvFlag(process.env.TP_REDUCE_ONLY ?? 'true'),
     },
+    stop: {
+      distancePct: Number(process.env.STOP_DISTANCE_PCT || 0.8),
+      reduceOnly: parseEnvFlag(process.env.STOP_REDUCE_ONLY ?? 'true'),
+    },
     profitLock: {
       lockTriggerUsdt: Number(process.env.LOCK_TRIGGER_USDT || 0),
       lockTriggerR: Number(process.env.LOCK_TRIGGER_R || 0.25),
       maxDdFromPeakUsdt: Number(process.env.MAX_DD_FROM_PEAK_USDT || 0),
-      maxDdFromPeakR: Number(process.env.MAX_DD_FROM_PEAK_R || 0.25),
+      maxDdFromPeakR: Number(process.env.MAX_DD_FROM_PEAK_R || 0.15),
     },
     reversalExitMode: String(process.env.REVERSAL_EXIT_MODE || 'MARKET').toUpperCase() === 'LIMIT' ? 'LIMIT' : 'MARKET',
     exitLimitBufferBps: Number(process.env.EXIT_LIMIT_BUFFER_BPS || 5),

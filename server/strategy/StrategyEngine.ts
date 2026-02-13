@@ -14,6 +14,7 @@ export interface StrategySignal {
 export interface StrategyInputs {
     price: number;
     atr: number;
+    avgAtr?: number;
     recentHigh: number;
     recentLow: number;
     obi: number;
@@ -21,6 +22,12 @@ export interface StrategyInputs {
     cvdSlope: number;
     ready: boolean;
     vetoReason: string | null;
+}
+
+interface ThresholdConfig {
+    obiThreshold: number;
+    deltaZThreshold: number;
+    cvdSlopeMin: number;
 }
 
 export class StrategyEngine {
@@ -51,12 +58,13 @@ export class StrategyEngine {
     }
 
     private checkSweepFade(inputs: StrategyInputs): StrategySignal {
+        const thresholds = this.getDynamicThresholds(inputs.atr, inputs.avgAtr || inputs.atr);
         const { price, recentHigh, recentLow, atr, obi, deltaZ } = inputs;
         const threshold = atr * 0.8; // Minor breach (scalp mode)
 
         // Sweep High (Short Opportunity)
         if (price > recentHigh && price < recentHigh + threshold) {
-            if (obi < -0.08 && deltaZ < -0.2) {
+            if (obi < -thresholds.obiThreshold && deltaZ < -thresholds.deltaZThreshold) {
                 return {
                     signal: 'SWEEP_FADE_SHORT',
                     score: 75,
@@ -72,7 +80,7 @@ export class StrategyEngine {
 
         // Sweep Low (Long Opportunity)
         if (price < recentLow && price > recentLow - threshold) {
-            if (obi > 0.08 && deltaZ > 0.2) {
+            if (obi > thresholds.obiThreshold && deltaZ > thresholds.deltaZThreshold) {
                 return {
                     signal: 'SWEEP_FADE_LONG',
                     score: 75,
@@ -90,12 +98,13 @@ export class StrategyEngine {
     }
 
     private checkBreakout(inputs: StrategyInputs): StrategySignal {
+        const thresholds = this.getDynamicThresholds(inputs.atr, inputs.avgAtr || inputs.atr);
         const { price, recentHigh, recentLow, obi, cvdSlope, deltaZ, atr } = inputs;
 
         // Breakout High
         const breakoutBuffer = atr * 0.25;
         if (price > recentHigh - breakoutBuffer) {
-            if (obi > 0.15 && cvdSlope > 0 && deltaZ > 0.3) {
+            if (obi > thresholds.obiThreshold && cvdSlope > thresholds.cvdSlopeMin && deltaZ > thresholds.deltaZThreshold) {
                 return {
                     signal: 'BREAKOUT_LONG',
                     score: 85,
@@ -111,7 +120,7 @@ export class StrategyEngine {
 
         // Breakout Low
         if (price < recentLow + breakoutBuffer) {
-            if (obi < -0.15 && cvdSlope < 0 && deltaZ < -0.3) {
+            if (obi < -thresholds.obiThreshold && cvdSlope < -thresholds.cvdSlopeMin && deltaZ < -thresholds.deltaZThreshold) {
                 return {
                     signal: 'BREAKOUT_SHORT',
                     score: 85,
@@ -126,5 +135,18 @@ export class StrategyEngine {
         }
 
         return { signal: null, score: 0, vetoReason: null, candidate: null };
+    }
+
+    private getDynamicThresholds(atr: number, avgAtr: number): ThresholdConfig {
+        const safeAvgAtr = avgAtr > 0 ? avgAtr : atr;
+        const volRatio = safeAvgAtr > 0 ? atr / safeAvgAtr : 1;
+
+        if (volRatio > 1.5) {
+            return { obiThreshold: 0.10, deltaZThreshold: 0.20, cvdSlopeMin: 0.01 };
+        }
+        if (volRatio < 0.7) {
+            return { obiThreshold: 0.25, deltaZThreshold: 0.50, cvdSlopeMin: 0.05 };
+        }
+        return { obiThreshold: 0.15, deltaZThreshold: 0.30, cvdSlopeMin: 0.02 };
     }
 }
