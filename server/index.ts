@@ -924,6 +924,29 @@ async function processSymbolEvent(s: string, d: any) {
         if (p > 0) {
             portfolioMonitor.ingestPrice(s, p);
         }
+
+        if (dryRunSession.isTrackingSymbol(s)) {
+            const hasDepth = ob.uiState === 'LIVE' && ob.bids.size > 0 && ob.asks.size > 0;
+            if (!hasDepth && Number.isFinite(p) && p > 0) {
+                const spreadBps = Number(process.env.DRY_RUN_SYNTH_SPREAD_BPS || 2);
+                const qty = Number(process.env.DRY_RUN_SYNTH_QTY || 5);
+                const bid = p * (1 - (spreadBps / 10000));
+                const ask = p * (1 + (spreadBps / 10000));
+                try {
+                    dryRunSession.ingestDepthEvent({
+                        symbol: s,
+                        eventTimestampMs: Number(t || now),
+                        markPrice: p,
+                        orderBook: {
+                            bids: [{ price: bid, qty }],
+                            asks: [{ price: ask, qty }],
+                        },
+                    });
+                } catch (e: any) {
+                    log('DRY_RUN_SYNTH_DEPTH_ERROR', { symbol: s, error: e?.message || 'dry_run_synth_depth_failed' });
+                }
+            }
+        }
         if (BACKFILL_RECORDING_ENABLED && Number.isFinite(p) && Number.isFinite(q)) {
             void marketArchive.recordTrade(s, { price: p, quantity: q, side }, Number(t || now));
         }

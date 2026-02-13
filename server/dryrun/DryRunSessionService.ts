@@ -129,6 +129,7 @@ type SymbolSession = {
   lastHeartbeatTs: number;
   lastDataLogTs: number;
   lastEmptyBookLogTs: number;
+  lastPerfTs: number;
   realizedPnl: number;
   feePaid: number;
   fundingPnl: number;
@@ -162,6 +163,7 @@ const DEFAULT_STOP_MAX_DIST = Number(process.env.DRY_RUN_STOP_MAX_DIST || 50);
 const DEFAULT_ATR_WINDOW = Number(process.env.DRY_RUN_ATR_WINDOW || 14);
 const DEFAULT_LARGE_LOSS_ALERT = Number(process.env.DRY_RUN_LARGE_LOSS_USDT || 500);
 const DEFAULT_LIMIT_STRATEGY = String(process.env.DRY_RUN_LIMIT_STRATEGY || 'MARKET').toUpperCase();
+const DEFAULT_PERF_SAMPLE_MS = Number(process.env.DRY_RUN_PERF_SAMPLE_MS || 2000);
 
 function parseLimitStrategy(input: string): LimitStrategyMode {
   switch (input) {
@@ -354,6 +356,7 @@ export class DryRunSessionService {
         lastHeartbeatTs: 0,
         lastDataLogTs: 0,
         lastEmptyBookLogTs: 0,
+        lastPerfTs: 0,
         realizedPnl: 0,
         feePaid: 0,
         fundingPnl: 0,
@@ -493,6 +496,7 @@ export class DryRunSessionService {
         lastHeartbeatTs: 0,
         lastDataLogTs: 0,
         lastEmptyBookLogTs: 0,
+        lastPerfTs: 0,
         realizedPnl: sessionSnapshot?.realizedPnl || 0,
         feePaid: sessionSnapshot?.feePaid || 0,
         fundingPnl: sessionSnapshot?.fundingPnl || 0,
@@ -683,9 +687,18 @@ export class DryRunSessionService {
         realizedPnl: out.log.realizedPnl,
         equity,
       });
+      session.lastPerfTs = eventTimestampMs;
 
       if (this.alertService && out.log.realizedPnl <= -DEFAULT_LARGE_LOSS_ALERT) {
         this.alertService.send('LARGE_LOSS', `${symbol}: realized PnL ${roundTo(out.log.realizedPnl, 2)} USDT`, 'HIGH');
+      }
+    }
+
+    if (out.log.realizedPnl === 0) {
+      const equity = session.lastState.walletBalance + this.computeUnrealizedPnl(session);
+      if (session.lastPerfTs === 0 || (eventTimestampMs - session.lastPerfTs) >= DEFAULT_PERF_SAMPLE_MS) {
+        session.performance.recordEquity(equity);
+        session.lastPerfTs = eventTimestampMs;
       }
     }
 

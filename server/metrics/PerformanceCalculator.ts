@@ -21,18 +21,25 @@ export class PerformanceCalculator {
   private maxDrawdown = 0;
   private peakPnL = 0;
   private pnlCurve: Array<{ timestamp: number; pnl: number }> = [];
+  private readonly maxCurvePoints = Number(process.env.DRY_RUN_PNL_CURVE_LIMIT || 2000);
 
   constructor(private readonly initialBalance: number = 0) {
     this.pnlCurve.push({ timestamp: Date.now(), pnl: 0 });
   }
 
   recordTrade(input: TradePerformanceInput): PerformanceMetrics {
-    this.totalPnL += input.realizedPnl;
     if (input.realizedPnl > 0) this.winCount += 1;
     if (input.realizedPnl < 0) this.lossCount += 1;
+    return this.recordEquity(input.equity);
+  }
 
+  recordEquity(equity: number): PerformanceMetrics {
+    this.totalPnL = equity - this.initialBalance;
     const now = Date.now();
     this.pnlCurve.push({ timestamp: now, pnl: this.totalPnL });
+    if (this.pnlCurve.length > this.maxCurvePoints) {
+      this.pnlCurve = this.pnlCurve.slice(this.pnlCurve.length - this.maxCurvePoints);
+    }
     this.peakPnL = Math.max(this.peakPnL, this.totalPnL);
     this.maxDrawdown = Math.max(this.maxDrawdown, this.peakPnL - this.totalPnL);
 
