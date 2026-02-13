@@ -38,6 +38,7 @@ export interface DryRunConfig {
   runId: string;
   walletBalanceStartUsdt: number;
   initialMarginUsdt: number;
+  leverage?: number;
   takerFeeRate: number;
   maintenanceMarginRate: number;
   fundingRate: number;

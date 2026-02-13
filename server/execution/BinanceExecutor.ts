@@ -1,25 +1,14 @@
 import { ExecutionConnector } from '../connectors/ExecutionConnector';
-import { OrderType, TimeInForce } from '../connectors/executionTypes';
+import { ExecutionDecision, ExecutionResult, IExecutor } from './types';
 
-export interface ExecutionDecision {
-    symbol: string;
-    side: 'BUY' | 'SELL';
-    price: number;
-    quantity: number;
-    type?: OrderType;
-    timeInForce?: TimeInForce;
-    stopPrice?: number;
-    reduceOnly?: boolean;
-}
-
-export class BinanceExecutor {
+export class BinanceExecutor implements IExecutor {
     private connector: ExecutionConnector;
 
     constructor(connector: ExecutionConnector) {
         this.connector = connector;
     }
 
-    public async execute(decision: ExecutionDecision): Promise<{ ok: boolean; orderId?: string; error?: string }> {
+    public async execute(decision: ExecutionDecision): Promise<ExecutionResult> {
         if (!this.connector.isExecutionEnabled()) {
             return { ok: false, error: 'EXECUTION_DISABLED' };
         }

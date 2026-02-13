@@ -2,6 +2,7 @@ import * as path from 'path';
 import { ExecutionConnector } from '../connectors/ExecutionConnector';
 import { ExecutionEvent, Side } from '../connectors/executionTypes';
 import { BinanceExecutor } from '../execution/BinanceExecutor';
+import { IExecutor } from '../execution/types';
 import { TradeLogger } from '../logger/TradeLogger';
 import { FundingRateMonitor } from '../metrics/FundingRateMonitor';
 import { RiskManager } from '../risk/RiskManager';
@@ -47,7 +48,7 @@ export class Orchestrator {
   private readonly expectedOrderMeta = new Map<string, ExpectedOrderMeta>();
   private readonly decisionLedger: any[] = [];
   private readonly stateSnapshots = new Map<string, SymbolState>();
-  private readonly executor: BinanceExecutor;
+  private readonly executor: IExecutor;
   private readonly logger: OrchestratorLogger;
   private readonly orderMonitor: OrderMonitor;
   private readonly tradeLogger: TradeLogger;

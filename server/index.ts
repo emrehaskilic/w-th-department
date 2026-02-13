@@ -42,7 +42,7 @@ import { OICalculator } from './metrics/OICalculator';
 import { SymbolEventQueue } from './utils/SymbolEventQueue';
 import { SnapshotTracker } from './telemetry/Snapshot';
 import { StrategyEngine } from './strategy/StrategyEngine';
-import { DryRunConfig, DryRunEngine, DryRunEventInput } from './dryrun';
+import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService } from './dryrun';
 
 // =============================================================================
 // Configuration
@@ -202,6 +202,7 @@ const backfillInFlight = new Set<string>();
 const backfillLastAttemptMs = new Map<string, number>();
 const BACKFILL_RETRY_INTERVAL_MS = 30_000;
 const orchestrator = createOrchestratorFromEnv();
+const dryRunSession = new DryRunSessionService();
 orchestrator.setKillSwitch(KILL_SWITCH);
 if (typeof process.env.EXECUTION_MODE !== 'undefined') {
     log('CONFIG_WARNING', { message: 'EXECUTION_MODE is deprecated and ignored' });
@@ -503,6 +504,7 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
 let ws: WebSocket | null = null;
 let wsState = 'disconnected';
 let activeSymbols = new Set<string>();
+const dryRunForcedSymbols = new Set<string>();
 const clients = new Set<WebSocket>();
 const clientSubs = new Map<WebSocket, Set<string>>();
 let autoScaleForcedSingle = false;
@@ -521,13 +523,15 @@ function updateStreams() {
         if (subs) subs.forEach(s => required.add(s));
     });
 
+    const forcedSorted = [...dryRunForcedSymbols].sort();
     const requiredSorted = [...required].sort();
     const limitedSymbols = requiredSorted.slice(0, Math.max(AUTO_SCALE_MIN_SYMBOLS, symbolConcurrencyLimit));
-    const effective = new Set<string>(limitedSymbols);
+    const effective = new Set<string>([...forcedSorted, ...limitedSymbols]);
 
     // Debug Log
-    if (requiredSorted.length > 0) {
+    if (requiredSorted.length > 0 || forcedSorted.length > 0) {
         log('AUTO_SCALE_DEBUG', {
+            forced: forcedSorted,
             requestedCount: requiredSorted.length,
             requested: requiredSorted,
             activeLimit: symbolConcurrencyLimit,
@@ -670,6 +674,29 @@ async function processDepthQueue(symbol: string) {
             const leg = getLegacy(symbol);
             const absVal = absorptionResult.get(symbol) ?? 0;
             broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, update.eventTimeMs || 0, null, 'depth');
+
+            const dryStatus = dryRunSession.getActiveSymbol();
+            if (dryStatus && dryStatus === symbol) {
+                const top = getTopLevels(ob, Number(process.env.DRY_RUN_ORDERBOOK_DEPTH || 20));
+                const bestBidPx = bestBid(ob);
+                const bestAskPx = bestAsk(ob);
+                const markPrice = (bestBidPx && bestAskPx)
+                    ? (bestBidPx + bestAskPx) / 2
+                    : (bestBidPx || bestAskPx || 0);
+                try {
+                    dryRunSession.ingestDepthEvent({
+                        symbol,
+                        eventTimestampMs: Number(update.eventTimeMs || 0),
+                        markPrice,
+                        orderBook: {
+                            bids: top.bids.map(([price, qty]) => ({ price, qty })),
+                            asks: top.asks.map(([price, qty]) => ({ price, qty })),
+                        },
+                    });
+                } catch (e: any) {
+                    log('DRY_RUN_EVENT_ERROR', { symbol, error: e?.message || 'dry_run_event_failed' });
+                }
+            }
         }
     } finally {
         meta.isProcessingDepthQueue = false;
@@ -1241,6 +1268,88 @@ app.post('/api/execution/refresh', async (req, res) => {
     }
 });
 
+app.get('/api/dry-run/symbols', async (req, res) => {
+    try {
+        const info = await fetchExchangeInfo();
+        const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
+        res.json({ ok: true, symbols });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'dry_run_symbols_failed', symbols: [] });
+    }
+});
+
+app.get('/api/dry-run/status', (req, res) => {
+    res.json({ ok: true, status: dryRunSession.getStatus() });
+});
+
+app.post('/api/dry-run/start', async (req, res) => {
+    try {
+        const symbol = String(req.body?.symbol || '').toUpperCase();
+        if (!symbol) {
+            res.status(400).json({ ok: false, error: 'symbol_required' });
+            return;
+        }
+
+        const info = await fetchExchangeInfo();
+        const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
+        if (!symbols.includes(symbol)) {
+            res.status(400).json({ ok: false, error: 'symbol_not_supported' });
+            return;
+        }
+
+        const fundingRate = lastFunding.get(symbol)?.rate ?? Number(req.body?.fundingRate ?? 0);
+        const status = dryRunSession.start({
+            symbol,
+            runId: req.body?.runId ? String(req.body.runId) : undefined,
+            walletBalanceStartUsdt: Number(req.body?.walletBalanceStartUsdt ?? 5000),
+            initialMarginUsdt: Number(req.body?.initialMarginUsdt ?? 200),
+            leverage: Number(req.body?.leverage ?? 10),
+            takerFeeRate: Number(req.body?.takerFeeRate ?? 0.0004),
+            maintenanceMarginRate: Number(req.body?.maintenanceMarginRate ?? 0.005),
+            fundingRate,
+            fundingIntervalMs: Number(req.body?.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
+        });
+
+        dryRunForcedSymbols.clear();
+        dryRunForcedSymbols.add(symbol);
+        updateStreams();
+
+        const ob = getOrderbook(symbol);
+        if (ob.lastUpdateId === 0 || ob.uiState === 'INIT') {
+            transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'dry_run_start');
+            fetchSnapshot(symbol, 'dry_run_start', true).catch((e) => {
+                log('DRY_RUN_SNAPSHOT_ERROR', { symbol, error: e?.message || 'dry_run_snapshot_failed' });
+            });
+        }
+
+        res.json({ ok: true, status });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'dry_run_start_failed' });
+    }
+});
+
+app.post('/api/dry-run/stop', (req, res) => {
+    try {
+        const status = dryRunSession.stop();
+        dryRunForcedSymbols.clear();
+        updateStreams();
+        res.json({ ok: true, status });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'dry_run_stop_failed' });
+    }
+});
+
+app.post('/api/dry-run/reset', (req, res) => {
+    try {
+        const status = dryRunSession.reset();
+        dryRunForcedSymbols.clear();
+        updateStreams();
+        res.json({ ok: true, status });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'dry_run_reset_failed' });
+    }
+});
+
 app.post('/api/dry-run/run', (req, res) => {
     try {
         const body = req.body || {};
@@ -1260,6 +1369,7 @@ app.post('/api/dry-run/run', (req, res) => {
             runId,
             walletBalanceStartUsdt: Number(body.walletBalanceStartUsdt ?? 5000),
             initialMarginUsdt: Number(body.initialMarginUsdt ?? 200),
+            leverage: Number(body.leverage ?? 1),
             takerFeeRate: Number(body.takerFeeRate ?? 0.0004),
             maintenanceMarginRate: Number(body.maintenanceMarginRate ?? 0.005),
             fundingRate: Number(body.fundingRate ?? 0),

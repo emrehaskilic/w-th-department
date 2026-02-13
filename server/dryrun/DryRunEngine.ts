@@ -67,6 +67,7 @@ export class DryRunEngine {
     fundingRate: Fp;
     fundingIntervalMs: number;
     initialMarginUsdt: Fp;
+    leverage: Fp;
   };
 
   private readonly idGen: DeterministicIdGenerator;
@@ -85,6 +86,10 @@ export class DryRunEngine {
     if (config.fundingIntervalMs <= 0) {
       throw new Error('invalid_funding_interval_ms');
     }
+    const leverage = Number.isFinite(config.leverage as number) ? Number(config.leverage) : 1;
+    if (leverage <= 0) {
+      throw new Error('invalid_leverage');
+    }
     this.cfg = {
       runId: config.runId,
       takerFeeRate: toFp(config.takerFeeRate),
@@ -92,6 +97,7 @@ export class DryRunEngine {
       fundingRate: toFp(config.fundingRate),
       fundingIntervalMs: config.fundingIntervalMs,
       initialMarginUsdt: toFp(config.initialMarginUsdt),
+      leverage: toFp(leverage),
     };
     this.walletBalance = toFp(config.walletBalanceStartUsdt);
     this.idGen = new DeterministicIdGenerator(config.runId);
@@ -475,7 +481,8 @@ export class DryRunEngine {
     if (referencePrice <= 0n) {
       return fpZero;
     }
-    const maxAbsQty = fpDiv(this.cfg.initialMarginUsdt, referencePrice);
+    const maxNotional = fpMul(this.cfg.initialMarginUsdt, this.cfg.leverage);
+    const maxAbsQty = fpDiv(maxNotional, referencePrice);
     const currentAfterCloseAbs = fpSub(fpAbs(currentQty), closePart);
     const availableOpenAbs = fpMax(fpZero, fpSub(maxAbsQty, currentAfterCloseAbs));
     const openingUsed = fpMin(openingPart, availableOpenAbs);
