@@ -1,4 +1,5 @@
 import { DeterministicIdGenerator } from './DeterministicId';
+import { MarketImpactSimulator } from './MarketImpactSimulator';
 import {
   Fp,
   fpAbs,
@@ -49,6 +50,8 @@ type FillComputation = {
   remainingQty: Fp;
   notional: Fp;
   avgPrice: Fp;
+  slippageBps?: number;
+  marketImpactBps?: number;
 };
 
 function sideToSignedQty(side: DryRunSide, qty: Fp): Fp {
@@ -71,6 +74,7 @@ export class DryRunEngine {
   };
 
   private readonly idGen: DeterministicIdGenerator;
+  private readonly marketImpactSimulator: MarketImpactSimulator;
 
   private walletBalance: Fp;
   private position: PositionInternal = null;
@@ -99,6 +103,7 @@ export class DryRunEngine {
       initialMarginUsdt: toFp(config.initialMarginUsdt),
       leverage: toFp(leverage),
     };
+    this.marketImpactSimulator = new MarketImpactSimulator(config.marketImpact);
     this.walletBalance = toFp(config.walletBalanceStartUsdt);
     this.idGen = new DeterministicIdGenerator(config.runId);
     this.fundingBoundaryInitialized = Number.isFinite(config.fundingBoundaryStartTsUTC as number);
@@ -418,6 +423,8 @@ export class DryRunEngine {
         avgFillPrice: fpRoundTo(fill.avgPrice, 8),
         fee: fpRoundTo(fee, 8),
         realizedPnl: fpRoundTo(pnlAndTrades.realizedPnl, 8),
+        slippageBps: fill.slippageBps,
+        marketImpactBps: fill.marketImpactBps,
         reason: status === 'REJECTED' ? 'ORDER_REJECTED' : null,
         tradeIds: pnlAndTrades.tradeIds,
       },
@@ -508,10 +515,17 @@ export class DryRunEngine {
     book: DryRunOrderBook;
     forceFullClose: boolean;
     markPriceFallback: Fp;
-  }): FillComputation {
+  }): FillComputation & { slippageBps: number; marketImpactBps: number } {
     const targetQty = input.qty;
     if (targetQty <= 0n) {
-      return { fillQty: fpZero, remainingQty: fpZero, notional: fpZero, avgPrice: fpZero };
+      return {
+        fillQty: fpZero,
+        remainingQty: fpZero,
+        notional: fpZero,
+        avgPrice: fpZero,
+        slippageBps: 0,
+        marketImpactBps: 0,
+      };
     }
 
     const levels = input.side === 'BUY' ? input.book.asks : input.book.bids;
@@ -552,12 +566,33 @@ export class DryRunEngine {
       remaining = fpZero;
     }
 
-    const avgPrice = filled > 0n ? fpDiv(notional, filled) : fpZero;
+    let avgPrice = filled > 0n ? fpDiv(notional, filled) : fpZero;
+    let slippageBps = 0;
+    let marketImpactBps = 0;
+
+    if (filled > 0n && avgPrice > 0n) {
+      const impact = this.marketImpactSimulator.adjustFill({
+        side: input.side,
+        type: input.type,
+        tif: input.tif,
+        requestedQty: targetQty,
+        filledQty: filled,
+        avgFillPrice: avgPrice,
+        book: input.book,
+      });
+      avgPrice = impact.adjustedAvgFillPrice;
+      notional = fpMul(filled, avgPrice);
+      slippageBps = impact.slippageBps;
+      marketImpactBps = impact.marketImpactBps;
+    }
+
     return {
       fillQty: filled,
       remainingQty: remaining,
       notional,
       avgPrice,
+      slippageBps,
+      marketImpactBps,
     };
   }
 

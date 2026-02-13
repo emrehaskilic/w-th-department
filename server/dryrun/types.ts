@@ -34,6 +34,13 @@ export interface DryRunProxyConfig {
   marketWsBaseUrl: string;
 }
 
+export interface DryRunMarketImpactConfig {
+  impactFactorBps?: number;
+  maxSlippageBps?: number;
+  queuePenaltyBps?: number;
+  topDepthLevels?: number;
+}
+
 export interface DryRunConfig {
   runId: string;
   walletBalanceStartUsdt: number;
@@ -45,6 +52,7 @@ export interface DryRunConfig {
   fundingIntervalMs: number;
   fundingBoundaryStartTsUTC?: number;
   proxy: DryRunProxyConfig;
+  marketImpact?: DryRunMarketImpactConfig;
 }
 
 export interface DryRunPosition {
@@ -64,6 +72,8 @@ export interface DryRunOrderResult {
   avgFillPrice: number;
   fee: number;
   realizedPnl: number;
+  slippageBps?: number;
+  marketImpactBps?: number;
   reason: string | null;
   tradeIds: string[];
 }

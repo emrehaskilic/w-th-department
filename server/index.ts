@@ -23,6 +23,7 @@ import { CvdCalculator } from './metrics/CvdCalculator';
 import { AbsorptionDetector } from './metrics/AbsorptionDetector';
 import { OpenInterestMonitor, OpenInterestMetrics } from './metrics/OpenInterestMonitor';
 import { FundingMonitor, FundingMetrics } from './metrics/FundingMonitor';
+import { OrderbookIntegrityMonitor } from './metrics/OrderbookIntegrityMonitor';
 import {
     OrderbookState,
     createOrderbookState,
@@ -196,6 +197,7 @@ const cvdMap = new Map<string, CvdCalculator>();
 const absorptionMap = new Map<string, AbsorptionDetector>();
 const absorptionResult = new Map<string, number>();
 const legacyMap = new Map<string, LegacyCalculator>();
+const orderbookIntegrityMap = new Map<string, OrderbookIntegrityMonitor>();
 
 // Monitor Caches
 const lastOpenInterest = new Map<string, OpenInterestMetrics>();
@@ -350,6 +352,12 @@ const getTaS = (s: string) => { if (!timeAndSalesMap.has(s)) timeAndSalesMap.set
 const getCvd = (s: string) => { if (!cvdMap.has(s)) cvdMap.set(s, new CvdCalculator()); return cvdMap.get(s)!; };
 const getAbs = (s: string) => { if (!absorptionMap.has(s)) absorptionMap.set(s, new AbsorptionDetector()); return absorptionMap.get(s)!; };
 const getLegacy = (s: string) => { if (!legacyMap.has(s)) legacyMap.set(s, new LegacyCalculator(s)); return legacyMap.get(s)!; };
+const getIntegrity = (s: string) => {
+    if (!orderbookIntegrityMap.has(s)) {
+        orderbookIntegrityMap.set(s, new OrderbookIntegrityMonitor(s));
+    }
+    return orderbookIntegrityMap.get(s)!;
+};
 
 // [PHASE 1 & 2] New Getters
 const getBackfill = (s: string) => { if (!backfillMap.has(s)) backfillMap.set(s, new KlineBackfill(s, BINANCE_REST_BASE)); return backfillMap.get(s)!; };
@@ -677,6 +685,30 @@ async function processDepthQueue(symbol: string) {
                 meta.goodSequenceStreak++;
             }
 
+            const integrity = getIntegrity(symbol).observe({
+                symbol,
+                sequenceStart: update.U,
+                sequenceEnd: update.u,
+                eventTimeMs: update.eventTimeMs || now,
+                bestBid: bestBid(ob),
+                bestAsk: bestAsk(ob),
+                nowMs: now,
+            });
+
+            if (integrity.reconnectRecommended && !meta.isResyncing) {
+                const timeSinceResync = now - meta.lastResyncTs;
+                if (timeSinceResync > MIN_RESYNC_INTERVAL_MS) {
+                    meta.lastResyncTs = now;
+                    getIntegrity(symbol).markReconnect(now);
+                    transitionOrderbookState(symbol, 'RESYNCING', 'integrity_reconnect', {
+                        level: integrity.level,
+                        message: integrity.message,
+                    });
+                    await fetchSnapshot(symbol, 'integrity_reconnect', true);
+                    break;
+                }
+            }
+
             evaluateLiveReadiness(symbol);
 
             const tas = getTaS(symbol);
@@ -942,6 +974,7 @@ function broadcastMetrics(
     const oiM = getOICalc(s).getMetrics();
     const oiLegacy = leg.getOpenInterestMetrics();
     const bf = getBackfill(s).getState();
+    const integrity = getIntegrity(s).getStatus(now);
 
     const payload: any = {
         type: 'metrics',
@@ -976,6 +1009,7 @@ function broadcastMetrics(
         },
         funding: lastFunding.get(s) || null,
         legacyMetrics: legacyM,
+        orderbookIntegrity: integrity,
         signalDisplay: signal || { signal: null, score: 0, vetoReason: bf.vetoReason || 'NO_SIGNAL', candidate: null },
         advancedMetrics: {
             sweepFadeScore: signal?.score || 0,
@@ -1013,7 +1047,8 @@ function broadcastMetrics(
             sentTo: sentCount,
             obiWeighted: legacyM?.obiWeighted ?? null,
             obiDeep: legacyM?.obiDeep ?? null,
-            obiDivergence: legacyM?.obiDivergence ?? null
+            obiDivergence: legacyM?.obiDivergence ?? null,
+            integrityLevel: integrity.level
         });
 
         // Debug: METRICS_SYMBOL_BIND for integrity check
@@ -1139,6 +1174,7 @@ app.get('/api/status', (req, res) => {
     activeSymbols.forEach(s => {
         const meta = getMeta(s);
         const ob = getOrderbook(s);
+        const integrity = getIntegrity(s).getStatus(now);
         const desync10s = countWindow(meta.desyncEvents, 10000, now);
         const desync60s = countWindow(meta.desyncEvents, 60000, now);
         const snapshotOk60s = countWindow(meta.snapshotOkEvents, 60000, now);
@@ -1171,6 +1207,7 @@ app.get('/api/status', (req, res) => {
                 bestBid: bestBid(ob),
                 bestAsk: bestAsk(ob)
             },
+            orderbookIntegrity: integrity,
             // Broadcast tracking
             metricsBroadcastCount10s: meta.metricsBroadcastCount10s,
             metricsBroadcastDepthCount10s: meta.metricsBroadcastDepthCount10s,

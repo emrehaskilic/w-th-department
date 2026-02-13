@@ -16,6 +16,11 @@ import * as SizingCalculationTests from './SizingCalculation.test';
 import * as OrderPlanTests from './OrderPlan.test';
 import * as DryRunEngineTests from './DryRunEngine.test';
 import * as DryRunSessionServiceTests from './DryRunSessionService.test';
+import * as SignalBoosterTests from './SignalBooster.test';
+import * as TimeframeAggregatorTests from './TimeframeAggregator.test';
+import * as MarketImpactSimulatorTests from './MarketImpactSimulator.test';
+import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.test';
+import * as StrategyEngineTests from './StrategyEngine.test';
 
 export const testSuites: { name: string; fn: () => void }[] = [
     { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
@@ -36,4 +41,9 @@ export const testSuites: { name: string; fn: () => void }[] = [
     { name: 'OrderPlan', fn: OrderPlanTests.runTests },
     { name: 'DryRunEngine', fn: DryRunEngineTests.runTests },
     { name: 'DryRunSessionService', fn: DryRunSessionServiceTests.runTests },
+    { name: 'SignalBooster', fn: SignalBoosterTests.runTests },
+    { name: 'TimeframeAggregator', fn: TimeframeAggregatorTests.runTests },
+    { name: 'MarketImpactSimulator', fn: MarketImpactSimulatorTests.runTests },
+    { name: 'OrderbookIntegrityMonitor', fn: OrderbookIntegrityMonitorTests.runTests },
+    { name: 'StrategyEngine', fn: StrategyEngineTests.runTests },
 ];

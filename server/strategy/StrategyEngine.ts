@@ -1,14 +1,23 @@
+import { SignalBooster, SignalConfidence } from './SignalBooster';
+import { TimeframeAggregator } from './TimeframeAggregator';
+
 export type SignalType = 'SWEEP_FADE_LONG' | 'SWEEP_FADE_SHORT' | 'BREAKOUT_LONG' | 'BREAKOUT_SHORT' | null;
 
 export interface StrategySignal {
     signal: SignalType;
     score: number;
+    confidence?: SignalConfidence;
     vetoReason: string | null;
     candidate: {
         entryPrice: number;
         tpPrice: number;
         slPrice: number;
     } | null;
+    boost?: {
+        score: number;
+        contributions: Record<string, number>;
+        timeframeMultipliers: Record<string, number>;
+    };
 }
 
 export interface StrategyInputs {
@@ -31,29 +40,67 @@ interface ThresholdConfig {
 }
 
 export class StrategyEngine {
+    private readonly signalBooster = new SignalBooster();
+    private readonly timeframeAggregator = new TimeframeAggregator();
+
     public compute(inputs: StrategyInputs): StrategySignal {
+        const now = Date.now();
+        const rawMetrics = {
+            obi: inputs.obi,
+            deltaZ: inputs.deltaZ,
+            cvdSlope: inputs.cvdSlope,
+        };
+        this.timeframeAggregator.add(rawMetrics, now);
+        const timeframeMultipliers = this.timeframeAggregator.getTimeframeMultipliers(rawMetrics, now);
+        const boost = this.signalBooster.boost({
+            obi: inputs.obi,
+            deltaZ: inputs.deltaZ,
+            cvdSlope: inputs.cvdSlope,
+            atr: inputs.atr,
+            avgAtr: inputs.avgAtr || inputs.atr,
+            price: inputs.price,
+            recentHigh: inputs.recentHigh,
+            recentLow: inputs.recentLow,
+        }, timeframeMultipliers);
+
         if (!inputs.ready) {
             return {
                 signal: null,
                 score: 0,
+                confidence: boost.confidence,
                 vetoReason: inputs.vetoReason || 'NOT_READY',
                 candidate: null,
+                boost: {
+                    score: Math.round(boost.score),
+                    contributions: boost.contributions,
+                    timeframeMultipliers,
+                },
             };
         }
 
         // 1) Sweep-Fade Strategy
         const sweepFade = this.checkSweepFade(inputs);
-        if (sweepFade.signal) return sweepFade;
+        if (sweepFade.signal) {
+            return this.withBoost(sweepFade, boost, timeframeMultipliers);
+        }
 
         // 2) Imbalance-Breakout Strategy
         const breakout = this.checkBreakout(inputs);
-        if (breakout.signal) return breakout;
+        if (breakout.signal) {
+            return this.withBoost(breakout, boost, timeframeMultipliers);
+        }
 
         return {
             signal: null,
-            score: 0,
+            score: Math.round(boost.score),
+            confidence: boost.confidence,
             vetoReason: 'NO_CRITERIA_MET',
             candidate: null,
+            boost: {
+                score: Math.round(boost.score),
+                contributions: boost.contributions,
+                timeframeMultipliers,
+            },
         };
     }
 
@@ -148,5 +195,38 @@ export class StrategyEngine {
             return { obiThreshold: 0.25, deltaZThreshold: 0.50, cvdSlopeMin: 0.05 };
         }
         return { obiThreshold: 0.15, deltaZThreshold: 0.30, cvdSlopeMin: 0.02 };
+    }
+
+    private withBoost(
+        baseSignal: StrategySignal,
+        boost: ReturnType<SignalBooster['boost']>,
+        timeframeMultipliers: Record<string, number>
+    ): StrategySignal {
+        const mergedScore = Math.round(Math.max(0, Math.min(100, (baseSignal.score * 0.55) + (boost.score * 0.45))));
+        if (mergedScore < 50) {
+            return {
+                signal: null,
+                score: mergedScore,
+                confidence: boost.confidence,
+                vetoReason: 'LOW_CONFIDENCE',
+                candidate: null,
+                boost: {
+                    score: Math.round(boost.score),
+                    contributions: boost.contributions,
+                    timeframeMultipliers,
+                },
+            };
+        }
+
+        return {
+            ...baseSignal,
+            score: mergedScore,
+            confidence: boost.confidence,
+            boost: {
+                score: Math.round(boost.score),
+                contributions: boost.contributions,
+                timeframeMultipliers,
+            },
+        };
     }
 }

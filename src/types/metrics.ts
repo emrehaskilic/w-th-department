@@ -1,12 +1,18 @@
 export interface SignalDisplay {
   signal: 'SWEEP_FADE_LONG' | 'SWEEP_FADE_SHORT' | 'BREAKOUT_LONG' | 'BREAKOUT_SHORT' | null;
   score: number;
+  confidence?: 'LOW' | 'MEDIUM' | 'HIGH';
   vetoReason: string | null;
   candidate: {
     entryPrice: number;
     tpPrice: number;
     slPrice: number;
   } | null;
+  boost?: {
+    score: number;
+    contributions: Record<string, number>;
+    timeframeMultipliers: Record<string, number>;
+  };
 }
 
 export interface SnapshotMetadata {
@@ -111,6 +117,17 @@ export interface MetricsMessage {
   openInterest: OpenInterestMetrics | null;
   funding: FundingContext | null;
   legacyMetrics: LegacyMetrics;
+  orderbookIntegrity?: {
+    symbol: string;
+    level: 'OK' | 'DEGRADED' | 'CRITICAL';
+    message: string;
+    lastUpdateTimestamp: number;
+    sequenceGapCount: number;
+    crossedBookDetected: boolean;
+    avgStalenessMs: number;
+    reconnectCount: number;
+    reconnectRecommended: boolean;
+  };
   signalDisplay: SignalDisplay;
   advancedMetrics: {
     sweepFadeScore: number;
