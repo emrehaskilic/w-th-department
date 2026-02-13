@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
 import { useTelemetrySocket } from '../services/useTelemetrySocket';
+import { withProxyApiKey } from '../services/proxyAuth';
 import { MetricsMessage } from '../types/metrics';
 
 interface DryRunConsoleLog {
@@ -99,6 +100,7 @@ const formatTs = (ts: number): string => {
 const DryRunDashboard: React.FC = () => {
   const hostname = window.location.hostname;
   const proxyUrl = (import.meta as any).env?.VITE_PROXY_API || `http://${hostname}:8787`;
+  const fetchWithAuth = (url: string, init?: RequestInit) => fetch(url, withProxyApiKey(init));
 
   const [availablePairs, setAvailablePairs] = useState<string[]>([]);
   const [isLoadingPairs, setIsLoadingPairs] = useState(true);
@@ -127,7 +129,7 @@ const DryRunDashboard: React.FC = () => {
     const loadPairs = async () => {
       setIsLoadingPairs(true);
       try {
-        const res = await fetch(`${proxyUrl}/api/dry-run/symbols`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/symbols`);
         const data = await res.json();
         const pairs = Array.isArray(data?.symbols) ? data.symbols : [];
         setAvailablePairs(pairs);
@@ -153,7 +155,7 @@ const DryRunDashboard: React.FC = () => {
 
     const poll = async () => {
       try {
-        const res = await fetch(`${proxyUrl}/api/dry-run/status`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/status`);
         const data = await res.json();
         if (!active) return;
         if (res.ok && data?.status) {
@@ -209,7 +211,7 @@ const DryRunDashboard: React.FC = () => {
       if (selectedPairs.length === 0) {
         throw new Error('at_least_one_pair_required');
       }
-      const res = await fetch(`${proxyUrl}/api/dry-run/start`, {
+      const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -234,7 +236,7 @@ const DryRunDashboard: React.FC = () => {
   const stopDryRun = async () => {
     setActionError(null);
     try {
-      const res = await fetch(`${proxyUrl}/api/dry-run/stop`, { method: 'POST' });
+      const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/stop`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'dry_run_stop_failed');
       setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
@@ -246,7 +248,7 @@ const DryRunDashboard: React.FC = () => {
   const resetDryRun = async () => {
     setActionError(null);
     try {
-      const res = await fetch(`${proxyUrl}/api/dry-run/reset`, { method: 'POST' });
+      const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/reset`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'dry_run_reset_failed');
       setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
@@ -265,7 +267,7 @@ const DryRunDashboard: React.FC = () => {
       if (!symbol) {
         throw new Error('symbol_required');
       }
-      const res = await fetch(`${proxyUrl}/api/dry-run/test-order`, {
+      const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/test-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol, side }),

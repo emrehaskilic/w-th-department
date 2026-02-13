@@ -1,16 +1,13 @@
 {
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "target": "ESNext",
     "module": "ESNext",
     "jsx": "react-jsx",
     "allowJs": true,
     "checkJs": false,
-    "esModuleInterop": true,
     "lib": ["DOM", "DOM.Iterable", "ESNext"],
     "moduleResolution": "Node",
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true
   },

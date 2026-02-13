@@ -1,15 +1,16 @@
-/* eslint-disable */
-// Connect to WS and subscribe to BTCUSDT
 const WebSocket = require('ws');
+const { API_HOST, API_PORT, withApiKeyQuery } = require('./auth/clientAuth.cjs');
+
 console.log('Connecting...');
-const client = new WebSocket('ws://localhost:8787/ws?symbols=BTCUSDT');
+const wsUrl = `ws://${API_HOST}:${API_PORT}${withApiKeyQuery('/ws?symbols=BTCUSDT')}`;
+const client = new WebSocket(wsUrl);
 
 client.on('open', () => {
-    console.log('Connected to WS');
+    console.log('Connected to WS:', wsUrl);
 });
 
 client.on('message', (data) => {
-    //   console.log('Message:', data.toString().substring(0, 50));
+    void data;
 });
 
 client.on('error', (err) => {

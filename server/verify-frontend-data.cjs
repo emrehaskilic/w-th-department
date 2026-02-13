@@ -1,6 +1,7 @@
 const WebSocket = require('ws');
-// Rest of the code is same
-const ws = new WebSocket('ws://localhost:8787/ws?symbols=BTCUSDT');
+const { API_HOST, API_PORT, withApiKeyQuery } = require('./auth/clientAuth.cjs');
+
+const ws = new WebSocket(`ws://${API_HOST}:${API_PORT}${withApiKeyQuery('/ws?symbols=BTCUSDT')}`);
 
 ws.on('open', () => {
     console.log('Connected to WS');

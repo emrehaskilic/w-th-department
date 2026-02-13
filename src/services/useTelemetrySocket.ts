@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { MetricsMessage, MetricsState } from '../types/metrics';
+import { withApiKeyInQuery } from './proxyAuth';
 
 /**
  * Hook that connects to the backend telemetry WebSocket and
@@ -44,7 +45,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
     // Try to use same port for WS if we're on the Nginx proxy (port 80/443)
     const wsPort = (port === '80' || port === '443' || port === '') ? '' : ':8787';
     const proxyWs = (import.meta as any).env?.VITE_PROXY_WS || `${protocol}//${hostname}${wsPort}`;
-    const url = `${proxyWs}/ws?symbols=${activeSymbols.join(',')}`;
+    const url = withApiKeyInQuery(`${proxyWs}/ws?symbols=${activeSymbols.join(',')}`);
 
     console.log(`[Telemetry] Connecting to WS: ${url} (attempt ${reconnectAttempts.current + 1})`);
 

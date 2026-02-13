@@ -6,6 +6,19 @@ This project was set up by Antigravity.
 - Node.js (v18+)
 - npm
 
+## Environment
+Create `server/.env` from `server/.env.example` and set:
+
+```bash
+API_KEY_SECRET=your-strong-api-key
+```
+
+Optional frontend env (`.env.local`):
+
+```bash
+VITE_PROXY_API_KEY=your-strong-api-key
+```
+
 ## Start the Project
 To start both the frontend and backend servers concurrently:
 

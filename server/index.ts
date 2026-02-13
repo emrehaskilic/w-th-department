@@ -41,6 +41,7 @@ import { KlineBackfill } from './backfill/KlineBackfill';
 import { OICalculator } from './metrics/OICalculator';
 import { SymbolEventQueue } from './utils/SymbolEventQueue';
 import { SnapshotTracker } from './telemetry/Snapshot';
+import { apiKeyMiddleware, validateWebSocketApiKey } from './auth/apiKey';
 import { StrategyEngine } from './strategy/StrategyEngine';
 import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService } from './dryrun';
 
@@ -1081,9 +1082,10 @@ const corsOptions = {
     },
     credentials: true,
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
 };
 app.use(cors(corsOptions));
+app.use('/api', apiKeyMiddleware);
 
 app.get('/api/health', (req, res) => {
     res.json({
@@ -1450,6 +1452,16 @@ const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (wc, req) => {
+    const authResult = validateWebSocketApiKey(req);
+    if (!authResult.ok) {
+        log('WS_AUTH_REJECT', {
+            reason: authResult.reason || 'unauthorized',
+            remoteAddress: req.socket.remoteAddress || null,
+        });
+        wc.close(1008, 'Unauthorized');
+        return;
+    }
+
     const p = new URL(req.url || '', 'http://l').searchParams.get('symbols') || '';
     const syms = p.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 

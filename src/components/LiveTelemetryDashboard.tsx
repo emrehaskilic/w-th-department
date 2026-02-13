@@ -3,6 +3,7 @@ import { useTelemetrySocket } from '../services/useTelemetrySocket';
 import { MetricsState, MetricsMessage } from '../types/metrics';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
+import { withProxyApiKey } from '../services/proxyAuth';
 
 type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
 
@@ -79,11 +80,12 @@ export const Dashboard: React.FC = () => {
 
   const hostname = window.location.hostname;
   const proxyUrl = (import.meta as any).env?.VITE_PROXY_API || `http://${hostname}:8787`;
+  const fetchWithAuth = (url: string, init?: RequestInit) => fetch(url, withProxyApiKey(init));
 
   useEffect(() => {
     const fetchPairs = async () => {
       try {
-        const res = await fetch(`${proxyUrl}/api/testnet/exchange-info`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/testnet/exchange-info`);
         const data = await res.json();
         const pairs = Array.isArray(data?.symbols) ? data.symbols : [];
         setAvailablePairs(pairs);
@@ -103,7 +105,7 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     const pollStatus = async () => {
       try {
-        const res = await fetch(`${proxyUrl}/api/execution/status`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/execution/status`);
         const data = (await res.json()) as ExecutionStatus;
         setExecutionStatus(data);
 
@@ -157,7 +159,7 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     const syncSelectedSymbols = async () => {
       try {
-        await fetch(`${proxyUrl}/api/execution/symbol`, {
+        await fetchWithAuth(`${proxyUrl}/api/execution/symbol`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ symbols: selectedPairs }),
@@ -183,7 +185,7 @@ export const Dashboard: React.FC = () => {
   const connectTestnet = async () => {
     setConnectionError(null);
     try {
-      const res = await fetch(`${proxyUrl}/api/execution/connect`, {
+      const res = await fetchWithAuth(`${proxyUrl}/api/execution/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ apiKey, apiSecret }),
@@ -201,7 +203,7 @@ export const Dashboard: React.FC = () => {
   const disconnectTestnet = async () => {
     setConnectionError(null);
     try {
-      const res = await fetch(`${proxyUrl}/api/execution/disconnect`, { method: 'POST' });
+      const res = await fetchWithAuth(`${proxyUrl}/api/execution/disconnect`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data?.error || 'disconnect_failed');
@@ -215,7 +217,7 @@ export const Dashboard: React.FC = () => {
   const setExecutionEnabled = async (enabled: boolean) => {
     setConnectionError(null);
     try {
-      const res = await fetch(`${proxyUrl}/api/execution/enabled`, {
+      const res = await fetchWithAuth(`${proxyUrl}/api/execution/enabled`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
@@ -231,7 +233,7 @@ export const Dashboard: React.FC = () => {
   };
 
   const refreshWalletPnl = async () => {
-    const res = await fetch(`${proxyUrl}/api/execution/refresh`, {
+    const res = await fetchWithAuth(`${proxyUrl}/api/execution/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
@@ -253,7 +255,7 @@ export const Dashboard: React.FC = () => {
         }
       });
 
-      const res = await fetch(`${proxyUrl}/api/execution/settings`, {
+      const res = await fetchWithAuth(`${proxyUrl}/api/execution/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

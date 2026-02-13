@@ -1,7 +1,9 @@
 const WebSocket = require('ws');
+const { API_HOST, API_PORT, withApiKeyQuery } = require('./auth/clientAuth.cjs');
 
 // Connect to multiple symbols and verify each has correct price
-const client = new WebSocket('ws://localhost:8787/ws?symbols=BTCUSDT,ETHUSDT,SOLUSDT');
+const wsPath = withApiKeyQuery('/ws?symbols=BTCUSDT,ETHUSDT,SOLUSDT');
+const client = new WebSocket(`ws://${API_HOST}:${API_PORT}${wsPath}`);
 
 const prices = {};
 

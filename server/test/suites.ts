@@ -1,0 +1,39 @@
+import * as TimeAndSalesTests from './TimeAndSales.test';
+import * as CvdTests from './CvdCalculator.test';
+import * as AbsorptionTests from './AbsorptionDetector.test';
+import * as OrderbookTests from './OrderbookManager.test';
+import * as OIMonitorTests from './OpenInterestMonitor.test';
+import * as FundingTests from './FundingMonitor.test';
+import * as LatencyTests from './Latency.test';
+import * as SequenceRuleTests from './SequenceRule.test';
+import * as ReconnectTests from './ReconnectContinuity.test';
+import * as LegacyTests from './LegacyCalculator.test';
+import * as GateTests from './Gate.test';
+import * as FreezePolicyTests from './FreezeEmergencyPolicy.test';
+import * as ProfitLockTests from './ProfitLock.test';
+import * as SizingRampTests from './SizingRamp.test';
+import * as SizingCalculationTests from './SizingCalculation.test';
+import * as OrderPlanTests from './OrderPlan.test';
+import * as DryRunEngineTests from './DryRunEngine.test';
+import * as DryRunSessionServiceTests from './DryRunSessionService.test';
+
+export const testSuites: { name: string; fn: () => void }[] = [
+    { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
+    { name: 'CvdCalculator', fn: CvdTests.runTests },
+    { name: 'AbsorptionDetector', fn: AbsorptionTests.runTests },
+    { name: 'OrderbookManager', fn: OrderbookTests.runTests },
+    { name: 'OpenInterestMonitor', fn: OIMonitorTests.runTests },
+    { name: 'FundingMonitor', fn: FundingTests.runTests },
+    { name: 'LatencyClamp', fn: LatencyTests.runTests },
+    { name: 'SequenceRule', fn: SequenceRuleTests.runTests },
+    { name: 'ReconnectContinuity', fn: ReconnectTests.runTests },
+    { name: 'LegacyCalculator', fn: LegacyTests.runTests },
+    { name: 'Gate', fn: GateTests.runTests },
+    { name: 'FreezeEmergencyPolicy', fn: FreezePolicyTests.runTests },
+    { name: 'ProfitLock', fn: ProfitLockTests.runTests },
+    { name: 'SizingRamp', fn: SizingRampTests.runTests },
+    { name: 'SizingCalculation', fn: SizingCalculationTests.runTests },
+    { name: 'OrderPlan', fn: OrderPlanTests.runTests },
+    { name: 'DryRunEngine', fn: DryRunEngineTests.runTests },
+    { name: 'DryRunSessionService', fn: DryRunSessionServiceTests.runTests },
+];

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { withApiKeyInQuery } from './services/proxyAuth';
 
 // Type definitions matching the telemetry contract
 interface ConsecutiveBurst {
@@ -356,7 +357,8 @@ const MetricsDashboard: React.FC = () => {
   useEffect(() => {
     const proxyWs = (import.meta as any).env?.VITE_PROXY_WS || 'ws://localhost:8787';
     const defaultSymbols = ['BTCUSDT', 'ETHUSDT'];
-    const ws = new WebSocket(`${proxyWs}/ws?symbols=${defaultSymbols.join(',')}`);
+    const wsUrl = withApiKeyInQuery(`${proxyWs}/ws?symbols=${defaultSymbols.join(',')}`);
+    const ws = new WebSocket(wsUrl);
     ws.onopen = () => setWsStatus('open');
     ws.onmessage = ev => {
       try {
