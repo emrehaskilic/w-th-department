@@ -8,6 +8,8 @@ import { DynamicStopLossService, DynamicStopLossConfig } from '../risk/DynamicSt
 import { PerformanceCalculator, PerformanceMetrics } from '../metrics/PerformanceCalculator';
 import { SessionStore } from './SessionStore';
 import { LimitOrderStrategy, LimitStrategyMode } from './LimitOrderStrategy';
+import { DryRunLogEvent, DryRunOrderflowMetrics, DryRunTradeLogger } from './DryRunTradeLogger';
+import path from 'path';
 
 export interface DryRunSessionStartInput {
   symbols?: string[];
@@ -105,6 +107,36 @@ export interface DryRunSessionStatus {
   }>;
 }
 
+type PendingEntryContext = {
+  reason: 'STRATEGY_SIGNAL' | 'MANUAL_TEST' | 'DEBUG_AGGRESSIVE_ENTRY' | 'UNKNOWN';
+  signalType: string | null;
+  signalScore: number | null;
+  candidate: StrategySignal['candidate'] | null;
+  orderflow: DryRunOrderflowMetrics;
+  boost?: StrategySignal['boost'];
+  market?: StrategySignal['market'];
+  timestampMs: number;
+  leverage: number | null;
+};
+
+type ActiveTrade = {
+  tradeId: string;
+  side: 'LONG' | 'SHORT';
+  entryTimeMs: number;
+  entryPrice: number;
+  qty: number;
+  notional: number;
+  marginUsed: number;
+  leverage: number;
+  pnlRealized: number;
+  feeAcc: number;
+  fundingAcc: number;
+  signalType: string | null;
+  signalScore: number | null;
+  candidate: StrategySignal['candidate'] | null;
+  orderflow: DryRunOrderflowMetrics;
+};
+
 type SymbolSession = {
   symbol: string;
   engine: DryRunEngine;
@@ -136,6 +168,11 @@ type SymbolSession = {
   eventCount: number;
   manualOrders: DryRunOrderRequest[];
   logTail: DryRunEventLog[];
+  pendingEntry: PendingEntryContext | null;
+  pendingExitReason: string | null;
+  tradeSeq: number;
+  currentTrade: ActiveTrade | null;
+  lastSnapshotLogTs: number;
 };
 
 const DEFAULT_TAKER_FEE_RATE = 0.0004;
@@ -164,6 +201,11 @@ const DEFAULT_ATR_WINDOW = Number(process.env.DRY_RUN_ATR_WINDOW || 14);
 const DEFAULT_LARGE_LOSS_ALERT = Number(process.env.DRY_RUN_LARGE_LOSS_USDT || 500);
 const DEFAULT_LIMIT_STRATEGY = String(process.env.DRY_RUN_LIMIT_STRATEGY || 'MARKET').toUpperCase();
 const DEFAULT_PERF_SAMPLE_MS = Number(process.env.DRY_RUN_PERF_SAMPLE_MS || 2000);
+const DEFAULT_TRADE_LOG_ENABLED = String(process.env.DRY_RUN_TRADE_LOGS || 'true').toLowerCase();
+const DEFAULT_TRADE_LOG_DIR = String(process.env.DRY_RUN_LOG_DIR || path.join(process.cwd(), 'server', 'logs', 'dryrun'));
+const DEFAULT_TRADE_LOG_QUEUE = Number(process.env.DRY_RUN_LOG_QUEUE_LIMIT || 10000);
+const DEFAULT_TRADE_LOG_DROP = Number(process.env.DRY_RUN_LOG_DROP_THRESHOLD || 2000);
+const DEFAULT_SNAPSHOT_LOG_MS = Number(process.env.DRY_RUN_SNAPSHOT_LOG_MS || 30_000);
 
 function parseLimitStrategy(input: string): LimitStrategyMode {
   switch (input) {
@@ -223,6 +265,8 @@ export class DryRunSessionService {
   private alphaDecay = new AlphaDecayAnalyzer();
   private readonly alertService?: AlertService;
   private readonly sessionStore: SessionStore;
+  private readonly tradeLogger?: DryRunTradeLogger;
+  private readonly tradeLogEnabled: boolean;
 
   constructor(alertService?: AlertService) {
     const sizingConfig: DynamicSizingConfig = {
@@ -254,6 +298,17 @@ export class DryRunSessionService {
     });
     this.alertService = alertService;
     this.sessionStore = new SessionStore();
+    this.tradeLogEnabled = !['false', '0', 'no'].includes(DEFAULT_TRADE_LOG_ENABLED);
+    if (this.tradeLogEnabled) {
+      this.tradeLogger = new DryRunTradeLogger({
+        dir: DEFAULT_TRADE_LOG_DIR,
+        queueLimit: finiteOr(DEFAULT_TRADE_LOG_QUEUE, 10000),
+        dropHaltThreshold: finiteOr(DEFAULT_TRADE_LOG_DROP, 2000),
+        onDropSpike: (count) => {
+          this.addConsoleLog('WARN', null, `Dry Run log backlog dropped ${count} events`, Date.now());
+        },
+      });
+    }
   }
 
   start(input: DryRunSessionStartInput): DryRunSessionStatus {
@@ -363,6 +418,11 @@ export class DryRunSessionService {
         eventCount: 0,
         manualOrders: [],
         logTail: [],
+        pendingEntry: null,
+        pendingExitReason: null,
+        tradeSeq: 0,
+        currentTrade: null,
+        lastSnapshotLogTs: 0,
       });
     }
 
@@ -503,6 +563,11 @@ export class DryRunSessionService {
         eventCount: sessionSnapshot?.eventCount || 0,
         manualOrders: [],
         logTail: [],
+        pendingEntry: null,
+        pendingExitReason: null,
+        tradeSeq: 0,
+        currentTrade: null,
+        lastSnapshotLogTs: 0,
       });
     }
 
@@ -545,6 +610,17 @@ export class DryRunSessionService {
       reduceOnly: false,
     });
 
+    session.pendingEntry = {
+      reason: 'MANUAL_TEST',
+      signalType: null,
+      signalScore: null,
+      candidate: null,
+      orderflow: this.buildOrderflowMetrics(undefined, session),
+      market: this.buildMarketMetrics({ price: referencePrice }, session),
+      timestampMs: Date.now(),
+      leverage: this.config.leverage,
+    };
+
     this.addConsoleLog('INFO', normalized, `Manual test order queued: ${side} ${qty}`, session.lastEventTimestampMs);
     return this.getStatus();
   }
@@ -563,6 +639,24 @@ export class DryRunSessionService {
     if (signal.signal.includes('SHORT')) side = 'SELL';
 
     if (!side) return;
+
+    const signalTs = Number.isFinite(timestampMs as number) ? Number(timestampMs) : Date.now();
+    const orderflow = this.buildOrderflowMetrics(signal.orderflow, session);
+    const market = this.buildMarketMetrics(signal.market, session);
+    this.logTradeEvent({
+      type: 'SIGNAL',
+      runId: this.getRunId(),
+      symbol: normalized,
+      timestampMs: signalTs,
+      side: side === 'BUY' ? 'LONG' : 'SHORT',
+      signalType: signal.signal,
+      score: signal.score,
+      vetoReason: signal.vetoReason,
+      candidate: signal.candidate,
+      orderflow,
+      boost: signal.boost,
+      market,
+    });
 
     // Avoid duplicate entries if already in a position
     if (session.lastState.position && session.lastState.position.side !== (side === 'BUY' ? 'LONG' : 'SHORT')) {
@@ -603,9 +697,20 @@ export class DryRunSessionService {
       session.manualOrders.push(order);
     }
 
-    const signalTs = Number.isFinite(timestampMs as number) ? Number(timestampMs) : Date.now();
     session.activeSignal = { type: signal.signal, timestampMs: signalTs };
     this.alphaDecay.recordSignal(normalized, signal.signal, signalTs);
+
+    session.pendingEntry = {
+      reason: 'STRATEGY_SIGNAL',
+      signalType: signal.signal,
+      signalScore: signal.score,
+      candidate: signal.candidate,
+      orderflow,
+      boost: signal.boost,
+      market,
+      timestampMs: signalTs,
+      leverage: sizing.leverage,
+    };
 
     this.addConsoleLog('INFO', normalized, `Strategy Signal Executed: ${signal.signal} (${side} ${qty} @ ~${referencePrice})`, session.lastEventTimestampMs);
   }
@@ -741,6 +846,9 @@ export class DryRunSessionService {
     if (out.log.liquidationTriggered) {
       this.addConsoleLog('WARN', symbol, 'Liquidation triggered. Position force-closed.', eventTimestampMs);
     }
+
+    this.handleTradeTransitions(session, prevPosition, out.log, out.state.position, eventTimestampMs);
+    this.maybeLogSnapshot(session, eventTimestampMs);
 
     return this.getStatus();
   }
@@ -922,6 +1030,18 @@ export class DryRunSessionService {
             });
             orders.push(...entryOrders);
             session.lastEntryEventTs = eventTimestampMs;
+            if (!session.pendingEntry) {
+              session.pendingEntry = {
+                reason: 'DEBUG_AGGRESSIVE_ENTRY',
+                signalType: null,
+                signalScore: null,
+                candidate: null,
+                orderflow: this.buildOrderflowMetrics(undefined, session),
+                market: this.buildMarketMetrics({ price: markPrice, atr: session.atr, avgAtr: session.avgAtr }, session),
+                timestampMs: eventTimestampMs,
+                leverage: sizing.leverage,
+              };
+            }
           }
         }
       }
@@ -947,6 +1067,7 @@ export class DryRunSessionService {
         timeInForce: 'GTC',
         reduceOnly: true,
       });
+      session.pendingExitReason = 'TAKE_PROFIT_LIMIT';
       return orders;
     }
 
@@ -972,6 +1093,7 @@ export class DryRunSessionService {
           timeInForce: 'IOC',
           reduceOnly: true,
         });
+        session.pendingExitReason = 'STOP_LOSS_DYNAMIC';
       }
       return orders;
     }
@@ -989,6 +1111,7 @@ export class DryRunSessionService {
         timeInForce: 'IOC',
         reduceOnly: true,
       });
+      session.pendingExitReason = 'STOP_LOSS_FIXED';
     }
 
     return orders;
@@ -1066,6 +1189,382 @@ export class DryRunSessionService {
       timeToLiquidationMs,
       fundingRateImpact: roundTo(fundingImpact, 4),
     };
+  }
+
+  private handleTradeTransitions(
+    session: SymbolSession,
+    prevPosition: DryRunStateSnapshot['position'],
+    log: DryRunEventLog,
+    nextPosition: DryRunStateSnapshot['position'],
+    eventTimestampMs: number
+  ): void {
+    if (!this.tradeLogger || !this.tradeLogEnabled) return;
+
+    const prevSide = prevPosition?.side ?? null;
+    const nextSide = nextPosition?.side ?? null;
+    const orderResults = Array.isArray(log.orderResults) ? log.orderResults : [];
+
+    let closingRealized = 0;
+    let closingFee = 0;
+    let closingQty = 0;
+    let closingNotional = 0;
+    let openingFee = 0;
+
+    if (prevSide) {
+      for (const order of orderResults) {
+        const fee = Number.isFinite(order.fee) ? Number(order.fee) : 0;
+        const realized = Number.isFinite(order.realizedPnl) ? Number(order.realizedPnl) : 0;
+        const filledQty = Number.isFinite(order.filledQty) ? Number(order.filledQty) : 0;
+        const avgPrice = Number.isFinite(order.avgFillPrice) ? Number(order.avgFillPrice) : 0;
+        if (this.isClosingOrder(prevSide, order.side)) {
+          closingFee += fee;
+          closingRealized += realized;
+          if (filledQty > 0 && avgPrice > 0) {
+            closingQty += filledQty;
+            closingNotional += filledQty * avgPrice;
+          }
+        } else {
+          openingFee += fee;
+        }
+      }
+    } else {
+      for (const order of orderResults) {
+        const fee = Number.isFinite(order.fee) ? Number(order.fee) : 0;
+        openingFee += fee;
+      }
+    }
+
+    const fundingImpact = Number.isFinite(log.fundingImpact) ? Number(log.fundingImpact) : 0;
+    const liquidation = log.liquidationTriggered || orderResults.some((o) => o.reason === 'FORCED_LIQUIDATION');
+
+    if (prevSide && prevPosition && !session.currentTrade) {
+      session.currentTrade = this.buildFallbackTradeFromPosition(session, prevPosition, eventTimestampMs);
+    }
+
+    if (!prevSide && nextSide && nextPosition) {
+      this.openTrade(session, nextPosition, eventTimestampMs, openingFee);
+      return;
+    }
+
+    if (prevSide && !nextSide) {
+      this.applyTradeAcc(session, closingRealized, closingFee, fundingImpact);
+      const exitPrice = closingQty > 0 ? closingNotional / closingQty : session.latestMarkPrice;
+      const reason = this.resolveExitReason(session, liquidation, closingRealized, null);
+      this.closeTrade(session, eventTimestampMs, exitPrice, prevPosition?.qty || 0, reason);
+      return;
+    }
+
+    if (prevSide && nextSide && nextPosition) {
+      const flipped = prevSide !== nextSide;
+      if (flipped) {
+        this.applyTradeAcc(session, closingRealized, closingFee, fundingImpact);
+        const exitPrice = closingQty > 0 ? closingNotional / closingQty : session.latestMarkPrice;
+        const reason = this.resolveExitReason(session, liquidation, closingRealized, 'FLIP');
+        this.closeTrade(session, eventTimestampMs, exitPrice, prevPosition?.qty || 0, reason);
+        this.openTrade(session, nextPosition, eventTimestampMs, openingFee);
+        return;
+      }
+
+      this.applyTradeAcc(session, closingRealized, closingFee + openingFee, fundingImpact);
+      this.updateTradePosition(session, nextPosition);
+    }
+  }
+
+  private openTrade(
+    session: SymbolSession,
+    position: NonNullable<DryRunStateSnapshot['position']>,
+    eventTimestampMs: number,
+    openingFee: number
+  ): void {
+    const context = session.pendingEntry;
+    const leverage = context?.leverage || session.dynamicLeverage || this.config?.leverage || 1;
+    const entryPrice = Number(position.entryPrice) || 0;
+    const qty = Number(position.qty) || 0;
+    const notional = entryPrice * qty;
+    const marginUsed = leverage > 0 ? notional / leverage : 0;
+    const tradeId = `${this.getRunId()}-${session.symbol}-${++session.tradeSeq}`;
+    const orderflow = context?.orderflow || this.buildOrderflowMetrics(undefined, session);
+
+    session.currentTrade = {
+      tradeId,
+      side: position.side,
+      entryTimeMs: eventTimestampMs,
+      entryPrice,
+      qty,
+      notional,
+      marginUsed,
+      leverage,
+      pnlRealized: 0,
+      feeAcc: openingFee,
+      fundingAcc: 0,
+      signalType: context?.signalType ?? null,
+      signalScore: context?.signalScore ?? null,
+      candidate: context?.candidate ?? null,
+      orderflow,
+    };
+
+    this.logTradeEvent({
+      type: 'ENTRY',
+      runId: this.getRunId(),
+      symbol: session.symbol,
+      timestampMs: eventTimestampMs,
+      tradeId,
+      side: position.side,
+      entryPrice,
+      qty,
+      notional,
+      marginUsed,
+      leverage,
+      reason: context?.reason || 'UNKNOWN',
+      signalType: context?.signalType ?? null,
+      signalScore: context?.signalScore ?? null,
+      orderflow,
+      candidate: context?.candidate ?? null,
+    });
+
+    session.pendingEntry = null;
+  }
+
+  private closeTrade(
+    session: SymbolSession,
+    eventTimestampMs: number,
+    exitPrice: number,
+    qty: number,
+    reason: string
+  ): void {
+    const trade = session.currentTrade || this.buildFallbackTrade(session, eventTimestampMs, qty);
+    const realized = trade.pnlRealized;
+    const feeUsdt = trade.feeAcc;
+    const fundingUsdt = trade.fundingAcc;
+    const net = realized - feeUsdt + fundingUsdt;
+    const returnPct = trade.marginUsed > 0 ? (net / trade.marginUsed) * 100 : null;
+    const rMultiple = this.computeRMultiple(trade, net);
+
+    this.logTradeEvent({
+      type: 'EXIT',
+      runId: this.getRunId(),
+      symbol: session.symbol,
+      timestampMs: eventTimestampMs,
+      tradeId: trade.tradeId,
+      side: trade.side,
+      entryTimeMs: trade.entryTimeMs,
+      entryPrice: trade.entryPrice,
+      exitPrice,
+      qty: trade.qty || qty,
+      reason,
+      durationMs: Math.max(0, eventTimestampMs - trade.entryTimeMs),
+      pnl: {
+        realizedUsdt: Number(realized.toFixed(8)),
+        feeUsdt: Number(feeUsdt.toFixed(8)),
+        fundingUsdt: Number(fundingUsdt.toFixed(8)),
+        netUsdt: Number(net.toFixed(8)),
+        returnPct: returnPct === null ? null : Number(returnPct.toFixed(4)),
+        rMultiple: rMultiple === null ? null : Number(rMultiple.toFixed(4)),
+      },
+      cumulative: this.buildCumulativeSummary(),
+      orderflow: trade.orderflow,
+      candidate: trade.candidate ?? null,
+    });
+
+    session.currentTrade = null;
+    session.pendingExitReason = null;
+  }
+
+  private updateTradePosition(session: SymbolSession, position: NonNullable<DryRunStateSnapshot['position']>): void {
+    if (!session.currentTrade) return;
+    const leverage = session.dynamicLeverage || session.currentTrade.leverage || this.config?.leverage || 1;
+    const entryPrice = Number(position.entryPrice) || session.currentTrade.entryPrice;
+    const qty = Number(position.qty) || session.currentTrade.qty;
+    const notional = entryPrice * qty;
+    const marginUsed = leverage > 0 ? notional / leverage : session.currentTrade.marginUsed;
+
+    session.currentTrade.side = position.side;
+    session.currentTrade.entryPrice = entryPrice;
+    session.currentTrade.qty = qty;
+    session.currentTrade.notional = notional;
+    session.currentTrade.marginUsed = marginUsed;
+    session.currentTrade.leverage = leverage;
+  }
+
+  private applyTradeAcc(session: SymbolSession, realized: number, fee: number, funding: number): void {
+    const trade = session.currentTrade;
+    if (!trade) return;
+    trade.pnlRealized += realized;
+    trade.feeAcc += fee;
+    trade.fundingAcc += funding;
+  }
+
+  private resolveExitReason(
+    session: SymbolSession,
+    liquidation: boolean,
+    realized: number,
+    fallback: string | null
+  ): string {
+    if (liquidation) return 'LIQUIDATION';
+    if (fallback) return fallback;
+    if (session.pendingExitReason) return session.pendingExitReason;
+    if (realized > 0) return 'TAKE_PROFIT';
+    if (realized < 0) return 'STOP_LOSS';
+    return 'CLOSE';
+  }
+
+  private computeRMultiple(trade: ActiveTrade, net: number): number | null {
+    const sl = trade.candidate?.slPrice;
+    if (!Number.isFinite(sl) || !(trade.qty > 0)) return null;
+    const risk = Math.abs(trade.entryPrice - Number(sl)) * trade.qty;
+    if (!(risk > 0)) return null;
+    return net / risk;
+  }
+
+  private buildFallbackTradeFromPosition(
+    session: SymbolSession,
+    position: NonNullable<DryRunStateSnapshot['position']>,
+    eventTimestampMs: number
+  ): ActiveTrade {
+    const leverage = session.dynamicLeverage || this.config?.leverage || 1;
+    const entryPrice = Number(position.entryPrice) || session.latestMarkPrice || 0;
+    const size = Number(position.qty) || 0;
+    const notional = entryPrice * size;
+    const marginUsed = leverage > 0 ? notional / leverage : 0;
+    const tradeId = `${this.getRunId()}-${session.symbol}-${++session.tradeSeq}`;
+    return {
+      tradeId,
+      side: position.side,
+      entryTimeMs: eventTimestampMs,
+      entryPrice,
+      qty: size,
+      notional,
+      marginUsed,
+      leverage,
+      pnlRealized: 0,
+      feeAcc: 0,
+      fundingAcc: 0,
+      signalType: null,
+      signalScore: null,
+      candidate: null,
+      orderflow: this.buildOrderflowMetrics(undefined, session),
+    };
+  }
+
+  private buildFallbackTrade(session: SymbolSession, eventTimestampMs: number, qty: number): ActiveTrade {
+    if (session.lastState.position) {
+      return this.buildFallbackTradeFromPosition(session, session.lastState.position, eventTimestampMs);
+    }
+    const leverage = session.dynamicLeverage || this.config?.leverage || 1;
+    const entryPrice = session.latestMarkPrice || 0;
+    const size = qty || 0;
+    const notional = entryPrice * size;
+    const marginUsed = leverage > 0 ? notional / leverage : 0;
+    const tradeId = `${this.getRunId()}-${session.symbol}-${++session.tradeSeq}`;
+    return {
+      tradeId,
+      side: 'LONG',
+      entryTimeMs: eventTimestampMs,
+      entryPrice,
+      qty: size,
+      notional,
+      marginUsed,
+      leverage,
+      pnlRealized: 0,
+      feeAcc: 0,
+      fundingAcc: 0,
+      signalType: null,
+      signalScore: null,
+      candidate: null,
+      orderflow: this.buildOrderflowMetrics(undefined, session),
+    };
+  }
+
+  private buildCumulativeSummary(): { totalPnL: number; totalTrades: number; winCount: number; winRate: number } {
+    const perf = this.getStatus().summary.performance;
+    if (!perf) {
+      return { totalPnL: 0, totalTrades: 0, winCount: 0, winRate: 0 };
+    }
+    return {
+      totalPnL: Number(perf.totalPnL.toFixed(8)),
+      totalTrades: perf.totalTrades,
+      winCount: perf.winCount,
+      winRate: perf.winRate,
+    };
+  }
+
+  private maybeLogSnapshot(session: SymbolSession, eventTimestampMs: number): void {
+    if (!this.tradeLogger || !this.tradeLogEnabled) return;
+    const intervalMs = Math.max(0, Math.trunc(DEFAULT_SNAPSHOT_LOG_MS));
+    if (intervalMs === 0) return;
+    if (session.lastSnapshotLogTs > 0 && (eventTimestampMs - session.lastSnapshotLogTs) < intervalMs) return;
+
+    const unrealized = this.computeUnrealizedPnl(session);
+    const totalEquity = session.lastState.walletBalance + unrealized;
+    this.logTradeEvent({
+      type: 'SNAPSHOT',
+      runId: this.getRunId(),
+      symbol: session.symbol,
+      timestampMs: eventTimestampMs,
+      markPrice: session.latestMarkPrice,
+      walletBalance: roundTo(session.lastState.walletBalance, 8),
+      totalEquity: roundTo(totalEquity, 8),
+      unrealizedPnl: roundTo(unrealized, 8),
+      realizedPnl: roundTo(session.realizedPnl, 8),
+      feePaid: roundTo(session.feePaid, 8),
+      fundingPnl: roundTo(session.fundingPnl, 8),
+      marginHealth: roundTo(session.lastState.marginHealth, 8),
+      position: session.lastState.position
+        ? {
+          side: session.lastState.position.side,
+          qty: roundTo(session.lastState.position.qty, 6),
+          entryPrice: roundTo(session.lastState.position.entryPrice, 8),
+        }
+        : null,
+    });
+
+    session.lastSnapshotLogTs = eventTimestampMs;
+  }
+
+  private buildOrderflowMetrics(
+    input?: StrategySignal['orderflow'],
+    session?: SymbolSession
+  ): DryRunOrderflowMetrics {
+    const norm = (value: unknown): number | null => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    };
+    return {
+      obiWeighted: norm(input?.obiWeighted),
+      obiDeep: norm(input?.obiDeep ?? session?.obi),
+      deltaZ: norm(input?.deltaZ),
+      cvdSlope: norm(input?.cvdSlope),
+    };
+  }
+
+  private buildMarketMetrics(
+    input?: StrategySignal['market'] & { price?: number | null },
+    session?: SymbolSession
+  ): { price: number | null; atr: number | null; avgAtr: number | null; recentHigh: number | null; recentLow: number | null } {
+    const norm = (value: unknown): number | null => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    };
+    return {
+      price: norm(input?.price ?? session?.latestMarkPrice),
+      atr: norm(input?.atr ?? session?.atr),
+      avgAtr: norm(input?.avgAtr ?? session?.avgAtr),
+      recentHigh: norm(input?.recentHigh),
+      recentLow: norm(input?.recentLow),
+    };
+  }
+
+  private isClosingOrder(prevSide: 'LONG' | 'SHORT', orderSide: 'BUY' | 'SELL'): boolean {
+    return (prevSide === 'LONG' && orderSide === 'SELL') || (prevSide === 'SHORT' && orderSide === 'BUY');
+  }
+
+  private logTradeEvent(event: DryRunLogEvent): void {
+    if (!this.tradeLogger || !this.tradeLogEnabled) return;
+    this.tradeLogger.log(event);
+  }
+
+  private getRunId(): string {
+    return this.runId || 'dryrun';
   }
 
   private addConsoleLog(

@@ -18,6 +18,19 @@ export interface StrategySignal {
         contributions: Record<string, number>;
         timeframeMultipliers: Record<string, number>;
     };
+    orderflow?: {
+        obiWeighted?: number | null;
+        obiDeep?: number | null;
+        deltaZ?: number | null;
+        cvdSlope?: number | null;
+    };
+    market?: {
+        price?: number | null;
+        atr?: number | null;
+        avgAtr?: number | null;
+        recentHigh?: number | null;
+        recentLow?: number | null;
+    };
 }
 
 export interface StrategyInputs {
@@ -45,6 +58,19 @@ export class StrategyEngine {
 
     public compute(inputs: StrategyInputs): StrategySignal {
         const now = Date.now();
+        const orderflow = {
+            obiWeighted: null,
+            obiDeep: inputs.obi,
+            deltaZ: inputs.deltaZ,
+            cvdSlope: inputs.cvdSlope,
+        };
+        const market = {
+            price: inputs.price,
+            atr: inputs.atr,
+            avgAtr: inputs.avgAtr || inputs.atr,
+            recentHigh: inputs.recentHigh,
+            recentLow: inputs.recentLow,
+        };
         const rawMetrics = {
             obi: inputs.obi,
             deltaZ: inputs.deltaZ,
@@ -70,6 +96,8 @@ export class StrategyEngine {
                 confidence: boost.confidence,
                 vetoReason: inputs.vetoReason || 'NOT_READY',
                 candidate: null,
+                orderflow,
+                market,
                 boost: {
                     score: Math.round(boost.score),
                     contributions: boost.contributions,
@@ -81,12 +109,16 @@ export class StrategyEngine {
         // 1) Sweep-Fade Strategy
         const sweepFade = this.checkSweepFade(inputs);
         if (sweepFade.signal) {
+            sweepFade.orderflow = orderflow;
+            sweepFade.market = market;
             return this.withBoost(sweepFade, boost, timeframeMultipliers);
         }
 
         // 2) Imbalance-Breakout Strategy
         const breakout = this.checkBreakout(inputs);
         if (breakout.signal) {
+            breakout.orderflow = orderflow;
+            breakout.market = market;
             return this.withBoost(breakout, boost, timeframeMultipliers);
         }
 
@@ -96,6 +128,8 @@ export class StrategyEngine {
             confidence: boost.confidence,
             vetoReason: 'NO_CRITERIA_MET',
             candidate: null,
+            orderflow,
+            market,
             boost: {
                 score: Math.round(boost.score),
                 contributions: boost.contributions,
@@ -210,6 +244,8 @@ export class StrategyEngine {
                 confidence: boost.confidence,
                 vetoReason: 'LOW_CONFIDENCE',
                 candidate: null,
+                orderflow: baseSignal.orderflow,
+                market: baseSignal.market,
                 boost: {
                     score: Math.round(boost.score),
                     contributions: boost.contributions,

@@ -981,6 +981,19 @@ async function processSymbolEvent(s: string, d: any) {
             ready: backfill.getState().ready,
             vetoReason: backfill.getState().vetoReason
         });
+        signal.orderflow = {
+            obiWeighted: legMetrics?.obiWeighted ?? null,
+            obiDeep: legMetrics?.obiDeep ?? null,
+            deltaZ: legMetrics?.deltaZ ?? null,
+            cvdSlope: legMetrics?.cvdSlope ?? null,
+        };
+        signal.market = {
+            price: p,
+            atr: backfill.getState().atr,
+            avgAtr: backfill.getState().avgAtr,
+            recentHigh: backfill.getState().recentHigh,
+            recentLow: backfill.getState().recentLow,
+        };
         latencyTracker.record('strategy_calc_ms', Date.now() - calcStart);
 
         // [PHASE 3] Execution Check
