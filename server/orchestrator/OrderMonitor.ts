@@ -13,6 +13,7 @@ export interface PendingLimitOrder {
   role: OrderRole;
   createdAtMs: number;
   timeoutMs: number;
+  repriceAttempts: number;
 }
 
 const DEFAULT_LIMIT_ORDER_TIMEOUT_MS = 30_000;
@@ -24,6 +25,16 @@ export class OrderMonitor {
     private readonly deps: {
       queryOrder: (symbol: string, orderId: string) => Promise<{ status: string; executedQty: number }>;
       cancelOrder: (symbol: string, orderId: string, clientOrderId?: string) => Promise<void>;
+      placeLimitOrder?: (input: {
+        symbol: string;
+        side: Side;
+        qty: number;
+        reduceOnly: boolean;
+        role: OrderRole;
+        repriceAttempt: number;
+        previousOrderId: string;
+        clientOrderId: string;
+      }) => Promise<{ orderId: string; clientOrderId: string; price: number } | null>;
       placeMarketOrder: (input: {
         symbol: string;
         side: Side;
@@ -33,6 +44,7 @@ export class OrderMonitor {
         fallbackFromOrderId: string;
       }) => Promise<void>;
       log?: (event: string, detail?: Record<string, any>) => void;
+      maxRepriceAttempts?: number;
     }
   ) { }
 
@@ -64,6 +76,7 @@ export class OrderMonitor {
       role: input.role,
       createdAtMs: input.createdAtMs || Date.now(),
       timeoutMs,
+      repriceAttempts: 0,
     });
   }
 
@@ -99,6 +112,50 @@ export class OrderMonitor {
         }
 
         const remainingQty = Math.max(0, order.qty - order.filledQty);
+        const maxRepriceAttempts = Number.isFinite(this.deps.maxRepriceAttempts as number)
+          ? Math.max(0, Number(this.deps.maxRepriceAttempts))
+          : 0;
+        const canReprice = Boolean(this.deps.placeLimitOrder) && order.repriceAttempts < maxRepriceAttempts;
+
+        if (remainingQty > 0 && canReprice) {
+          const repriceAttempt = order.repriceAttempts + 1;
+          const replacement = await this.deps.placeLimitOrder!({
+            symbol: order.symbol,
+            side: order.side,
+            qty: remainingQty,
+            reduceOnly: order.reduceOnly,
+            role: order.role,
+            repriceAttempt,
+            previousOrderId: order.orderId,
+            clientOrderId: order.clientOrderId,
+          });
+          if (replacement && replacement.orderId) {
+            this.pendingLimitOrders.delete(order.orderId);
+            this.pendingLimitOrders.set(replacement.orderId, {
+              orderId: replacement.orderId,
+              clientOrderId: replacement.clientOrderId,
+              symbol: order.symbol,
+              side: order.side,
+              price: replacement.price,
+              qty: remainingQty,
+              filledQty: 0,
+              reduceOnly: order.reduceOnly,
+              role: order.role,
+              createdAtMs: Date.now(),
+              timeoutMs: order.timeoutMs,
+              repriceAttempts: repriceAttempt,
+            });
+            this.deps.log?.('LIMIT_REPRICE_SUBMITTED', {
+              symbol: order.symbol,
+              previousOrderId: order.orderId,
+              orderId: replacement.orderId,
+              role: order.role,
+              attempt: repriceAttempt,
+            });
+            continue;
+          }
+        }
+
         if (remainingQty > 0) {
           await this.deps.placeMarketOrder({
             symbol: order.symbol,

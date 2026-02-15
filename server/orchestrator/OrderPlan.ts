@@ -132,8 +132,8 @@ export function calculateLimitPrice(
   const safeTick = Number.isFinite(tickSize) && tickSize > 0 ? tickSize : 0.01;
   const buffer = currentPrice * (bufferBps / 10_000);
   const raw = side === 'BUY'
-    ? currentPrice + buffer
-    : currentPrice - buffer;
+    ? currentPrice - buffer
+    : currentPrice + buffer;
   const rounded = Math.round(raw / safeTick) * safeTick;
   const tickDigits = safeTick.toString().includes('.') ? safeTick.toString().split('.')[1].replace(/0+$/, '').length : 0;
   return Number(rounded.toFixed(tickDigits));

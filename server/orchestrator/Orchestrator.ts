@@ -50,6 +50,7 @@ export class Orchestrator {
   private readonly expectedOrderMeta = new Map<string, ExpectedOrderMeta>();
   private readonly decisionLedger: any[] = [];
   private readonly stateSnapshots = new Map<string, SymbolState>();
+  private readonly atrBySymbol = new Map<string, number>();
   private readonly executor: IExecutor;
   private readonly logger: OrchestratorLogger;
   private readonly orderMonitor: OrderMonitor;
@@ -62,6 +63,12 @@ export class Orchestrator {
 
   private killSwitch = false;
   private replayMode = false;
+  private dailyLossState = {
+    dayKey: this.currentDayKey(),
+    startBalance: 0,
+    realizedPnl: 0,
+    triggered: false,
+  };
 
   private capitalSettings = {
     leverage: 10,
@@ -92,10 +99,12 @@ export class Orchestrator {
     this.orderMonitor = new OrderMonitor({
       queryOrder: (symbol, orderId) => this.connector.queryOrder(symbol, orderId),
       cancelOrder: (symbol, orderId, clientOrderId) => this.connector.cancelOrder({ symbol, orderId, clientOrderId }),
+      placeLimitOrder: async (input) => this.placeLimitRepriceOrder(input),
       placeMarketOrder: async (fallback) => {
         await this.placeMarketFallbackOrder(fallback);
       },
       log: (event, detail) => this.log(event, detail || {}),
+      maxRepriceAttempts: Number(process.env.LIMIT_REPRICE_MAX || 2),
     });
 
     this.connector.onExecutionEvent((event) => {
@@ -135,6 +144,7 @@ export class Orchestrator {
 
   ingest(metrics: OrchestratorMetricsInput) {
     const symbol = metrics.symbol.toUpperCase();
+    this.updateVolatilityFromMetrics(symbol, metrics);
     this.refreshFundingIfNeeded(symbol);
     this.connector.ensureSymbol(symbol);
     const envelope = this.buildMetricsEnvelope(symbol, metrics);
@@ -156,6 +166,7 @@ export class Orchestrator {
     gate: GateResult;
   }) {
     const symbol = input.symbol.toUpperCase();
+    this.updateVolatilityFromMetrics(symbol, input.metrics);
     const envelope: MetricsEventEnvelope = {
       kind: 'metrics',
       symbol,
@@ -401,6 +412,7 @@ export class Orchestrator {
       getMaxLeverage: () => this.getEffectiveLeverage(),
       hardStopLossPct: this.config.hardStopLossPct,
       liquidationEmergencyMarginRatio: this.config.liquidationEmergencyMarginRatio,
+      allowedSides: this.config.plan.allowedSides,
       liquidationRiskConfig: {
         yellowThreshold: Number(process.env.LIQ_RISK_YELLOW_RATIO || 0.30),
         orangeThreshold: Number(process.env.LIQ_RISK_ORANGE_RATIO || 0.20),
@@ -458,6 +470,7 @@ export class Orchestrator {
       getExecutionReady: () => this.getExecutionGateState().ready,
       getBackoffActive: () => this.connector.isRateLimitBackoffActive(),
       getFundingShortBlocked: () => this.isFundingShortBlocked(normalized),
+      getVolatilityFactor: (symbol) => this.getVolatilityFactor(symbol),
       onPositionClosed: (close) => this.onPositionClosed(normalized, close),
       markAddUsed: () => {},
       cooldownConfig: this.config.cooldown,
@@ -574,6 +587,10 @@ export class Orchestrator {
     const ramp = this.ensureRamp(symbol);
     ramp.onTradeClosed(close.realizedPnl);
     this.getRiskManager(symbol).recordTradeClosed(close.realizedPnl, this.connector.getWalletBalance() || 0);
+    const daily = this.updateDailyLoss(close.realizedPnl);
+    if (daily.triggered) {
+      void this.triggerDailyKillSwitch('daily_drawdown', daily.drawdownPct);
+    }
 
     const leverage = this.getEffectiveLeverage();
     const notional = close.entryPrice * close.qty;
@@ -1089,6 +1106,146 @@ export class Orchestrator {
     }
   }
 
+  private updateVolatilityFromMetrics(symbol: string, metrics: OrchestratorMetricsInput) {
+    const raw = Number(metrics.advancedMetrics?.volatilityIndex ?? 0);
+    if (Number.isFinite(raw) && raw > 0) {
+      this.atrBySymbol.set(symbol.toUpperCase(), raw);
+    }
+  }
+
+  private getVolatilityFactor(symbol: string): number {
+    const cfg = this.config.plan.volatilitySizing;
+    if (!cfg || !cfg.enabled) return 1;
+    const refSymbol = (cfg.referenceSymbol || 'ETHUSDT').toUpperCase();
+    const refAtr = this.atrBySymbol.get(refSymbol) || 0;
+    const symAtr = this.atrBySymbol.get(symbol.toUpperCase()) || 0;
+    if (!(refAtr > 0) || !(symAtr > 0)) return 1;
+    const raw = refAtr / symAtr;
+    const minFactor = Number.isFinite(cfg.minFactor) ? cfg.minFactor : 0.2;
+    const maxFactor = Number.isFinite(cfg.maxFactor) ? cfg.maxFactor : 2.0;
+    return Math.max(minFactor, Math.min(maxFactor, raw));
+  }
+
+  private updateDailyLoss(realizedPnl: number): { triggered: boolean; drawdownPct: number | null } {
+    const nowKey = this.currentDayKey();
+    if (nowKey !== this.dailyLossState.dayKey) {
+      this.dailyLossState = {
+        dayKey: nowKey,
+        startBalance: 0,
+        realizedPnl: 0,
+        triggered: false,
+      };
+    }
+    if (this.dailyLossState.startBalance <= 0) {
+      const wallet = this.connector.getWalletBalance() || 0;
+      if (wallet > 0) {
+        this.dailyLossState.startBalance = wallet;
+      }
+    }
+    this.dailyLossState.realizedPnl += realizedPnl;
+    if (!(this.dailyLossState.startBalance > 0)) {
+      return { triggered: false, drawdownPct: null };
+    }
+    const drawdownPct = this.dailyLossState.realizedPnl / this.dailyLossState.startBalance;
+    if (!this.dailyLossState.triggered && this.config.dailyKillSwitchPct > 0 && drawdownPct <= -this.config.dailyKillSwitchPct) {
+      this.dailyLossState.triggered = true;
+      return { triggered: true, drawdownPct };
+    }
+    return { triggered: false, drawdownPct };
+  }
+
+  private async triggerDailyKillSwitch(reason: string, drawdownPct: number | null) {
+    if (this.killSwitch) return;
+    this.killSwitch = true;
+    this.log('DAILY_KILL_SWITCH_TRIGGERED', { reason, drawdownPct });
+    this.alertService?.send('DAILY_KILL_SWITCH', `Kill switch engaged: ${reason}`, 'CRITICAL');
+
+    for (const [symbol, actor] of this.actors.entries()) {
+      const position = actor.state.position;
+      try {
+        await this.connector.cancelAllOpenOrders(symbol);
+      } catch (e: any) {
+        this.log('KILL_SWITCH_CANCEL_ERROR', { symbol, error: e?.message || 'cancel_failed' });
+      }
+      if (!position || !(position.qty > 0)) {
+        continue;
+      }
+      const side: Side = position.side === 'LONG' ? 'SELL' : 'BUY';
+      try {
+        await this.connector.placeOrder({
+          symbol,
+          side,
+          type: 'MARKET',
+          quantity: position.qty,
+          reduceOnly: true,
+          clientOrderId: `ks_${Date.now()}_${Math.floor(Math.random() * 10_000)}`,
+        });
+        this.log('KILL_SWITCH_FLATTEN_SENT', { symbol, side, qty: position.qty });
+      } catch (e: any) {
+        this.log('KILL_SWITCH_FLATTEN_ERROR', { symbol, error: e?.message || 'flatten_failed' });
+      }
+    }
+  }
+
+  private async placeLimitRepriceOrder(input: {
+    symbol: string;
+    side: Side;
+    qty: number;
+    reduceOnly: boolean;
+    role: PlannedOrder['role'];
+    repriceAttempt: number;
+    previousOrderId: string;
+    clientOrderId: string;
+  }): Promise<{ orderId: string; clientOrderId: string; price: number } | null> {
+    const price = this.getMakerLimitPrice(input.symbol, input.side);
+    if (!(price > 0)) {
+      this.log('LIMIT_REPRICE_PRICE_MISSING', { symbol: input.symbol, previousOrderId: input.previousOrderId });
+      return null;
+    }
+    try {
+      const res = await this.connector.placeOrder({
+        symbol: input.symbol,
+        side: input.side,
+        type: 'LIMIT',
+        quantity: input.qty,
+        price,
+        timeInForce: 'GTC',
+        reduceOnly: input.reduceOnly,
+        clientOrderId: input.clientOrderId,
+      });
+      return { orderId: res.orderId, clientOrderId: input.clientOrderId, price };
+    } catch (e: any) {
+      this.log('LIMIT_REPRICE_ERROR', {
+        symbol: input.symbol,
+        previousOrderId: input.previousOrderId,
+        error: e?.message || 'reprice_failed',
+      });
+      return null;
+    }
+  }
+
+  private getMakerLimitPrice(symbol: string, side: Side): number | null {
+    const quote = this.connector.getQuote(symbol);
+    if (quote && Number.isFinite(quote.bestBid) && Number.isFinite(quote.bestAsk)) {
+      if (side === 'BUY') {
+        return quote.bestBid > 0 ? quote.bestBid : null;
+      }
+      return quote.bestAsk > 0 ? quote.bestAsk : null;
+    }
+    const fallback = this.connector.expectedPrice(symbol, side, 'MARKET');
+    if (!(typeof fallback === 'number' && Number.isFinite(fallback) && fallback > 0)) {
+      return null;
+    }
+    const bufferBps = Number(process.env.LIMIT_REPRICE_BUFFER_BPS || this.config.plan.limitBufferBps || 2);
+    const buffer = fallback * (bufferBps / 10_000);
+    return side === 'BUY' ? Math.max(0, fallback - buffer) : fallback + buffer;
+  }
+
+  private currentDayKey(): string {
+    const d = new Date();
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+
   private async waitForIdle(actor: SymbolActor): Promise<void> {
     if (actor.isIdle()) {
       return;
@@ -1154,6 +1311,17 @@ export function createOrchestratorFromEnv(alertService?: AlertService): Orchestr
     orderQtyTolerancePct: Number(process.env.PLAN_QTY_TOL_PCT || 1),
     replaceThrottlePerSecond: Number(process.env.PLAN_REPLACE_THROTTLE_PER_SEC || 5),
     cancelStalePlanOrders: parseEnvFlag(process.env.PLAN_CANCEL_STALE ?? 'true'),
+    allowedSides: String(process.env.ALLOWED_SIDES || 'BOTH').toUpperCase() === 'LONG'
+      ? 'LONG'
+      : String(process.env.ALLOWED_SIDES || 'BOTH').toUpperCase() === 'SHORT'
+        ? 'SHORT'
+        : 'BOTH',
+    volatilitySizing: {
+      enabled: parseEnvFlag(process.env.VOLATILITY_SIZING_ENABLED ?? 'true'),
+      referenceSymbol: String(process.env.VOLATILITY_REF_SYMBOL || 'ETHUSDT').toUpperCase(),
+      minFactor: Number(process.env.VOLATILITY_MIN_FACTOR || 0.2),
+      maxFactor: Number(process.env.VOLATILITY_MAX_FACTOR || 2.0),
+    },
     boot: {
       probeMarketPct: Number(process.env.BOOT_PROBE_MARKET_PCT || 0.15),
       waitReadyMs: Number(process.env.BOOT_WAIT_READY_MS || 1500),
@@ -1192,6 +1360,7 @@ export function createOrchestratorFromEnv(alertService?: AlertService): Orchestr
     stop: {
       distancePct: Number(process.env.STOP_DISTANCE_PCT || 0.8),
       reduceOnly: parseEnvFlag(process.env.STOP_REDUCE_ONLY ?? 'true'),
+      riskPct: Number(process.env.STOP_RISK_PCT || 0),
     },
     profitLock: {
       lockTriggerUsdt: Number(process.env.LOCK_TRIGGER_USDT || 0),
@@ -1234,6 +1403,7 @@ export function createOrchestratorFromEnv(alertService?: AlertService): Orchestr
     rampDecayPct: Number(process.env.RAMP_DECAY_PCT || 20),
     rampMaxMult: Number(process.env.RAMP_MAX_MULT || 5),
     hardStopLossPct: Number(process.env.HARD_STOP_LOSS_PCT || 1),
+    dailyKillSwitchPct: Number(process.env.DAILY_KILL_SWITCH_PCT || 0.05),
     liquidationEmergencyMarginRatio: Number(process.env.LIQUIDATION_EMERGENCY_MARGIN_RATIO || 0.3),
     takerFeeBps: Number(process.env.TAKER_FEE_BPS || 4),
     profitLockBufferBps: Number(process.env.PROFIT_LOCK_BUFFER_BPS || 2),

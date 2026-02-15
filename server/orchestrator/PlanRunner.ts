@@ -28,6 +28,7 @@ export interface PlanTickInput {
   leverage: number;
   currentMarginBudgetUsdt: number;
   startingMarginUsdt: number;
+  volatilityFactor?: number;
   freezeActive?: boolean;
   backoffActive?: boolean;
   fundingShortBlocked?: boolean;
@@ -257,15 +258,15 @@ export class PlanRunner {
   }
 
   private pickBootSide(metrics: OrchestratorMetricsInput, trendState: TrendState): Side | null {
-    if (trendState === 'UP') return 'BUY';
-    if (trendState === 'DOWN') return 'SELL';
+    if (trendState === 'UP') return this.filterSide('BUY');
+    if (trendState === 'DOWN') return this.filterSide('SELL');
     const deltaZ = Number(metrics.legacyMetrics?.deltaZ ?? 0);
     if (Math.abs(deltaZ) >= this.config.boot.minDeltaZ) {
-      return deltaZ > 0 ? 'BUY' : 'SELL';
+      return this.filterSide(deltaZ > 0 ? 'BUY' : 'SELL');
     }
     const cvdSlope = Number(metrics.legacyMetrics?.cvdSlope ?? 0);
     if (Math.abs(cvdSlope) >= this.config.boot.minDeltaZ) {
-      return cvdSlope > 0 ? 'BUY' : 'SELL';
+      return this.filterSide(cvdSlope > 0 ? 'BUY' : 'SELL');
     }
     return null;
   }
@@ -298,10 +299,12 @@ export class PlanRunner {
     const walletCap = Number.isFinite(input.currentMarginBudgetUsdt) && input.currentMarginBudgetUsdt > 0
       ? Math.min(base, input.currentMarginBudgetUsdt)
       : base;
+    const volFactor = this.resolveVolatilityFactor(input);
+    const adjusted = walletCap * volFactor;
     if (Number.isFinite(this.config.maxMarginUsdt) && this.config.maxMarginUsdt > 0) {
-      return Math.min(walletCap, this.config.maxMarginUsdt);
+      return Math.min(adjusted, this.config.maxMarginUsdt);
     }
-    return Math.max(0, walletCap);
+    return Math.max(0, adjusted);
   }
 
   private updatePlanState(position: SymbolState['position'], noOpenOrders: boolean) {
@@ -530,7 +533,7 @@ export class PlanRunner {
     }
 
     if (position) {
-      const stopOrder = this.buildStopOrder(symbol, position);
+      const stopOrder = this.buildStopOrder(symbol, position, leverage);
       if (stopOrder) {
         desired.push(stopOrder);
       }
@@ -662,8 +665,8 @@ export class PlanRunner {
     return orders;
   }
 
-  private buildStopOrder(symbol: string, position: NonNullable<SymbolState['position']>): PlannedOrder | null {
-    const distPct = Math.max(0.01, this.config.stop.distancePct);
+  private buildStopOrder(symbol: string, position: NonNullable<SymbolState['position']>, leverage: number): PlannedOrder | null {
+    const distPct = this.resolveStopDistancePct(this.config.stop.distancePct, leverage);
     const side: Side = position.side === 'LONG' ? 'SELL' : 'BUY';
     const stopPrice = position.side === 'LONG'
       ? position.entryPrice * (1 - distPct / 100)
@@ -777,6 +780,37 @@ export class PlanRunner {
       return (bid + ask) / 2;
     }
     return bid > 0 ? bid : ask;
+  }
+
+  private resolveVolatilityFactor(input: PlanTickInput): number {
+    const cfg = this.config.volatilitySizing;
+    if (!cfg || !cfg.enabled) {
+      return 1;
+    }
+    const raw = Number(input.volatilityFactor);
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return 1;
+    }
+    const minFactor = Number.isFinite(cfg.minFactor) ? cfg.minFactor : 0.2;
+    const maxFactor = Number.isFinite(cfg.maxFactor) ? cfg.maxFactor : 2.0;
+    return Math.max(minFactor, Math.min(maxFactor, raw));
+  }
+
+  private filterSide(side: Side | null): Side | null {
+    if (!side) return null;
+    const allowed = (this.config.allowedSides || 'BOTH').toUpperCase();
+    if (allowed === 'BOTH') return side;
+    if (allowed === 'LONG') return side === 'BUY' ? side : null;
+    if (allowed === 'SHORT') return side === 'SELL' ? side : null;
+    return side;
+  }
+
+  private resolveStopDistancePct(defaultPct: number, leverage: number): number {
+    const riskPct = Number(this.config.stop.riskPct ?? 0);
+    if (riskPct > 0 && Number.isFinite(leverage) && leverage > 0) {
+      return Math.max(0.01, riskPct / leverage);
+    }
+    return Math.max(0.01, defaultPct);
   }
 
   private resolveMarketPrice(metrics: OrchestratorMetricsInput, side: Side): number {

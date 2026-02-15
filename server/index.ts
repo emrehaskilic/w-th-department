@@ -1191,6 +1191,9 @@ function broadcastMetrics(
             prints_per_second: tasMetrics.printsPerSecond,
             best_bid: bestBidPx,
             best_ask: bestAskPx,
+            advancedMetrics: {
+                volatilityIndex: bf.atr
+            },
             funding: lastFunding.get(s)
                 ? {
                     rate: lastFunding.get(s)?.rate ?? null,

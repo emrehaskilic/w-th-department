@@ -57,6 +57,7 @@ export interface SymbolActorDeps {
   getExecutionReady?: () => boolean;
   getBackoffActive?: () => boolean;
   getFundingShortBlocked?: () => boolean;
+  getVolatilityFactor?: (symbol: string) => number;
   onPositionClosed: (close: {
     realizedPnl: number;
     side: 'LONG' | 'SHORT';
@@ -168,6 +169,7 @@ export class SymbolActor {
         leverage: this.deps.getEffectiveLeverage(),
         currentMarginBudgetUsdt: this.deps.getCurrentMarginBudgetUsdt(),
         startingMarginUsdt: this.deps.getStartingMarginUsdt(),
+        volatilityFactor: this.deps.getVolatilityFactor ? this.deps.getVolatilityFactor(envelope.symbol) : undefined,
         freezeActive: this.state.execQuality.freezeActive,
         backoffActive: this.deps.getBackoffActive ? this.deps.getBackoffActive() : false,
         fundingShortBlocked: this.deps.getFundingShortBlocked ? this.deps.getFundingShortBlocked() : false,

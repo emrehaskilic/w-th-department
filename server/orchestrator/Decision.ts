@@ -9,6 +9,7 @@ export interface DecisionDependencies {
   getMaxLeverage: () => number;
   hardStopLossPct: number;
   liquidationEmergencyMarginRatio: number;
+  allowedSides?: 'BOTH' | 'LONG' | 'SHORT';
   liquidationRiskConfig?: {
     yellowThreshold?: number;
     orangeThreshold?: number;
@@ -77,7 +78,7 @@ export class DecisionEngine {
     if (state.position === null) {
       if (!state.halted && !freezeActive && !state.hasOpenEntryOrder && state.openOrders.size === 0 && !inCooldown) {
         const side = deltaZ > 0 ? 'BUY' : deltaZ < 0 ? 'SELL' : null;
-        if (side) {
+        if (side && this.isSideAllowed(side)) {
           const price = this.deps.expectedPrice(symbol, side, 'MARKET');
           if (price && price > 0) {
             const probeQuantity = this.computeProbeQuantity({
@@ -141,6 +142,9 @@ export class DecisionEngine {
 
     if (canAdd) {
       const side = position.side === 'LONG' ? 'BUY' : 'SELL';
+      if (!this.isSideAllowed(side)) {
+        return actions.length > 0 ? actions : [{ type: 'NOOP', symbol, event_time_ms, reason: 'side_not_allowed' }];
+      }
       const price = this.deps.expectedPrice(symbol, side, 'MARKET');
       if (price && price > 0) {
         const qty = this.computeProbeQuantity({
@@ -221,6 +225,14 @@ export class DecisionEngine {
       return (bid + ask) / 2;
     }
     return null;
+  }
+
+  private isSideAllowed(side: 'BUY' | 'SELL'): boolean {
+    const allowed = (this.deps.allowedSides || 'BOTH').toUpperCase();
+    if (allowed === 'BOTH') return true;
+    if (allowed === 'LONG') return side === 'BUY';
+    if (allowed === 'SHORT') return side === 'SELL';
+    return true;
   }
 
   private activateProfitLockIfEligible(state: SymbolState, marketPrice: number | null) {

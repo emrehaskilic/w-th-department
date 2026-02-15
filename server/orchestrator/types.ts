@@ -8,6 +8,9 @@ export interface OrchestratorMetricsInput {
   prints_per_second?: number | null;
   best_bid?: number | null;
   best_ask?: number | null;
+  advancedMetrics?: {
+    volatilityIndex?: number | null;
+  } | null;
   legacyMetrics?: {
     obiDeep?: number | null;
     deltaZ?: number | null;
@@ -160,6 +163,13 @@ export interface OrderPlanConfig {
   orderQtyTolerancePct: number;
   replaceThrottlePerSecond: number;
   cancelStalePlanOrders: boolean;
+  allowedSides?: 'BOTH' | 'LONG' | 'SHORT';
+  volatilitySizing?: {
+    enabled: boolean;
+    referenceSymbol: string;
+    minFactor: number;
+    maxFactor: number;
+  };
   boot: {
     probeMarketPct: number;
     waitReadyMs: number;
@@ -198,6 +208,7 @@ export interface OrderPlanConfig {
   stop: {
     distancePct: number;
     reduceOnly: boolean;
+    riskPct?: number;
   };
   profitLock: {
     lockTriggerUsdt: number;
@@ -233,6 +244,7 @@ export interface OrchestratorConfig {
   rampDecayPct: number;
   rampMaxMult: number;
   hardStopLossPct: number;
+  dailyKillSwitchPct: number;
   liquidationEmergencyMarginRatio: number;
   takerFeeBps: number;
   profitLockBufferBps: number;
