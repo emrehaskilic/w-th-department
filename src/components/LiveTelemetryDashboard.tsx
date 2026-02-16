@@ -85,7 +85,7 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     const fetchPairs = async () => {
       try {
-        const res = await fetchWithAuth(`${proxyUrl}/api/testnet/exchange-info`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/exchange-info`);
         const data = await res.json();
         const pairs = Array.isArray(data?.symbols) ? data.symbols : [];
         setAvailablePairs(pairs);
@@ -93,7 +93,7 @@ export const Dashboard: React.FC = () => {
           setSelectedPairs([pairs[0]]);
         }
       } catch {
-        setAvailablePairs(['BTCUSDT', 'ETHUSDT', 'SOLUSDT']);
+        setAvailablePairs([]);
       } finally {
         setIsLoadingPairs(false);
       }

@@ -100,9 +100,9 @@ const LIVE_SNAPSHOT_FRESH_MS = Number(process.env.LIVE_SNAPSHOT_FRESH_MS || 1500
 const LIVE_DESYNC_RATE_10S_MAX = Number(process.env.LIVE_DESYNC_RATE_10S_MAX || 50);
 const LIVE_QUEUE_MAX = Number(process.env.LIVE_QUEUE_MAX || 200);
 const LIVE_GOOD_SEQUENCE_MIN = Number(process.env.LIVE_GOOD_SEQUENCE_MIN || 25);
-const AUTO_SCALE_MIN_SYMBOLS = 1;
-const AUTO_SCALE_LIVE_DOWN_PCT = 80;
-const AUTO_SCALE_LIVE_UP_PCT = 95;
+const AUTO_SCALE_MIN_SYMBOLS = Number(process.env.AUTO_SCALE_MIN_SYMBOLS || 5);
+const AUTO_SCALE_LIVE_DOWN_PCT = Number(process.env.AUTO_SCALE_LIVE_DOWN_PCT || 50);
+const AUTO_SCALE_LIVE_UP_PCT = Number(process.env.AUTO_SCALE_LIVE_UP_PCT || 90);
 const AUTO_SCALE_UP_HOLD_MS = 10 * 60 * 1000;
 const DEPTH_LEVELS = Number(process.env.DEPTH_LEVELS || 20);
 const DEPTH_STREAM_MODE = String(process.env.DEPTH_STREAM_MODE || 'diff').toLowerCase(); // diff | partial
@@ -270,7 +270,7 @@ const EXCHANGE_INFO_TTL_MS = 1000 * 60 * 60; // 1 hr
 
 // Global Rate Limit
 let globalBackoffUntil = 0; // Starts at 0 to allow fresh attempts on restart
-let symbolConcurrencyLimit = Math.max(AUTO_SCALE_MIN_SYMBOLS, Number(process.env.SYMBOL_CONCURRENCY || 10));
+let symbolConcurrencyLimit = Math.max(AUTO_SCALE_MIN_SYMBOLS, Number(process.env.SYMBOL_CONCURRENCY || 20));
 let autoScaleLastUpTs = 0;
 
 // =============================================================================
@@ -654,15 +654,11 @@ function updateStreams() {
         wsState = 'connected';
         log('WS_OPEN', {});
 
-        let delay = 0;
         activeSymbols.forEach((symbol) => {
             const ob = getOrderbook(symbol);
             if (ob.uiState === 'INIT' || ob.lastUpdateId === 0) {
                 transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'ws_open_seed');
-                setTimeout(() => {
-                    fetchSnapshot(symbol, 'ws_open_seed', true).catch(() => { });
-                }, delay);
-                delay += 2000;
+                fetchSnapshot(symbol, 'ws_open_seed', true).catch(() => { });
             }
         });
     });
@@ -1410,9 +1406,15 @@ app.get('/api/exchange-info', async (req, res) => {
 app.get('/api/testnet/exchange-info', async (req, res) => {
     try {
         const symbols = await orchestrator.listTestnetFuturesPairs();
-        res.json({ symbols });
+        if (Array.isArray(symbols) && symbols.length > 0) {
+            res.json({ symbols });
+            return;
+        }
+        const mainnet = await fetchExchangeInfo();
+        res.json({ symbols: Array.isArray(mainnet?.symbols) ? mainnet.symbols : [], fallback: 'mainnet' });
     } catch (e: any) {
-        res.status(500).json({ error: e.message || 'testnet_exchange_info_failed' });
+        const mainnet = await fetchExchangeInfo();
+        res.json({ symbols: Array.isArray(mainnet?.symbols) ? mainnet.symbols : [], fallback: 'mainnet' });
     }
 });
 

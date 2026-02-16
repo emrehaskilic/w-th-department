@@ -16,7 +16,7 @@ type ConnectionContext = {
 
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_STALE_CONNECTION_MS = 60_000;
-const DEFAULT_MAX_SUBSCRIPTIONS_PER_CLIENT = 50;
+const DEFAULT_MAX_SUBSCRIPTIONS_PER_CLIENT = 200;
 
 export class WebSocketManager {
   private readonly clients = new Set<WebSocket>();
