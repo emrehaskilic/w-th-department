@@ -11,16 +11,16 @@ import * as LegacyTests from './LegacyCalculator.test';
 import * as GateTests from './Gate.test';
 import * as FreezePolicyTests from './FreezeEmergencyPolicy.test';
 import * as ProfitLockTests from './ProfitLock.test';
-import * as SizingRampTests from './SizingRamp.test';
-import * as SizingCalculationTests from './SizingCalculation.test';
 import * as OrderPlanTests from './OrderPlan.test';
 import * as DryRunEngineTests from './DryRunEngine.test';
 import * as DryRunSessionServiceTests from './DryRunSessionService.test';
-import * as SignalBoosterTests from './SignalBooster.test';
-import * as TimeframeAggregatorTests from './TimeframeAggregator.test';
+import * as NormalizationTests from './Normalization.test';
+import * as RegimeSelectorTests from './RegimeSelector.test';
+import * as StrategyHysteresisTests from './StrategyHysteresis.test';
+import * as HardReversalTests from './HardReversal.test';
 import * as MarketImpactSimulatorTests from './MarketImpactSimulator.test';
 import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.test';
-import * as StrategyEngineTests from './StrategyEngine.test';
+// StrategyEngine removed; NEW_STRATEGY_V1.1 tests below.
 import * as DryRunClockTests from './DryRunClock.test';
 import * as FreezeControllerTests from './FreezeController.test';
 
@@ -38,16 +38,15 @@ export const testSuites: { name: string; fn: () => void }[] = [
     { name: 'Gate', fn: GateTests.runTests },
     { name: 'FreezeEmergencyPolicy', fn: FreezePolicyTests.runTests },
     { name: 'ProfitLock', fn: ProfitLockTests.runTests },
-    { name: 'SizingRamp', fn: SizingRampTests.runTests },
-    { name: 'SizingCalculation', fn: SizingCalculationTests.runTests },
     { name: 'OrderPlan', fn: OrderPlanTests.runTests },
     { name: 'DryRunEngine', fn: DryRunEngineTests.runTests },
     { name: 'DryRunSessionService', fn: DryRunSessionServiceTests.runTests },
-    { name: 'SignalBooster', fn: SignalBoosterTests.runTests },
-    { name: 'TimeframeAggregator', fn: TimeframeAggregatorTests.runTests },
+    { name: 'Normalization', fn: NormalizationTests.runTests },
+    { name: 'RegimeSelector', fn: RegimeSelectorTests.runTests },
     { name: 'MarketImpactSimulator', fn: MarketImpactSimulatorTests.runTests },
     { name: 'OrderbookIntegrityMonitor', fn: OrderbookIntegrityMonitorTests.runTests },
-    { name: 'StrategyEngine', fn: StrategyEngineTests.runTests },
+    { name: 'StrategyHysteresis', fn: StrategyHysteresisTests.runTests },
+    { name: 'HardReversal', fn: HardReversalTests.runTests },
     { name: 'DryRunClock', fn: DryRunClockTests.runTests },
     { name: 'FreezeController', fn: FreezeControllerTests.runTests },
 ];

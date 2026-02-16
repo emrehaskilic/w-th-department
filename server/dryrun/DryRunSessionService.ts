@@ -1,9 +1,8 @@
 import { DryRunEngine } from './DryRunEngine';
 import { DryRunConfig, DryRunEventInput, DryRunEventLog, DryRunOrderBook, DryRunOrderRequest, DryRunReasonCode, DryRunStateSnapshot } from './types';
-import { StrategySignal } from '../strategy/StrategyEngine';
-import { AlphaDecayAnalyzer } from '../strategy/AlphaDecayAnalyzer';
+import { StrategyDecision, StrategyActionType, StrategyPositionState, StrategyRegime, StrategySignal, StrategySide } from '../types/strategy';
 import { AlertService } from '../notifications/AlertService';
-import { PositionSizingService, DynamicSizingConfig } from './PositionSizingService';
+import { RiskGovernorV11 } from '../risk/RiskGovernorV11';
 import { PerformanceCalculator, PerformanceMetrics } from '../metrics/PerformanceCalculator';
 import { SessionStore } from './SessionStore';
 import { LimitOrderStrategy, LimitStrategyMode } from './LimitOrderStrategy';
@@ -321,9 +320,8 @@ export class DryRunSessionService {
   private symbols: string[] = [];
   private sessions = new Map<string, SymbolSession>();
   private logTail: DryRunConsoleLog[] = [];
-  private sizingService: PositionSizingService;
   private limitStrategy: LimitOrderStrategy;
-  private alphaDecay = new AlphaDecayAnalyzer();
+  private readonly riskGovernor = new RiskGovernorV11();
   private readonly alertService?: AlertService;
   private readonly sessionStore: SessionStore;
   private readonly tradeLogger?: DryRunTradeLogger;
@@ -333,19 +331,6 @@ export class DryRunSessionService {
   private readonly addOnManager: AddOnManager;
 
   constructor(alertService?: AlertService) {
-    const sizingConfig: DynamicSizingConfig = {
-      baseLeverage: 10,
-      winStreakMultiplier: DEFAULT_WIN_STREAK_MULT,
-      lossStreakDivisor: DEFAULT_LOSS_STREAK_DIV,
-      martingaleFactor: DEFAULT_MARTINGALE_FACTOR,
-      martingaleMaxSteps: DEFAULT_MARTINGALE_MAX,
-      marginHealthLeverageFactor: 2,
-      minLeverage: 1,
-      maxLeverage: 50,
-      maxPositionNotionalUsdt: DEFAULT_MAX_NOTIONAL,
-    };
-
-    this.sizingService = new PositionSizingService(sizingConfig);
     this.limitStrategy = new LimitOrderStrategy({
       mode: parseLimitStrategy(DEFAULT_LIMIT_STRATEGY),
       splitLevels: 3,
@@ -410,7 +395,6 @@ export class DryRunSessionService {
     this.sessions.clear();
     this.logTail = [];
     this.consoleSeq = 0;
-    this.alphaDecay = new AlphaDecayAnalyzer();
 
     this.config = {
       walletBalanceStartUsdt,
@@ -423,18 +407,6 @@ export class DryRunSessionService {
       heartbeatIntervalMs,
       debugAggressiveEntry,
     };
-
-    this.sizingService = new PositionSizingService({
-      baseLeverage: leverage,
-      winStreakMultiplier: DEFAULT_WIN_STREAK_MULT,
-      lossStreakDivisor: DEFAULT_LOSS_STREAK_DIV,
-      martingaleFactor: DEFAULT_MARTINGALE_FACTOR,
-      martingaleMaxSteps: DEFAULT_MARTINGALE_MAX,
-      marginHealthLeverageFactor: 2,
-      minLeverage: 1,
-      maxLeverage: Math.max(leverage, 50),
-      maxPositionNotionalUsdt: DEFAULT_MAX_NOTIONAL,
-    });
 
     for (const symbol of this.symbols) {
       const fundingRate = Number.isFinite(input.fundingRates?.[symbol] as number)
@@ -538,7 +510,6 @@ export class DryRunSessionService {
     this.sessions.clear();
     this.logTail = [];
     this.consoleSeq = 0;
-    this.alphaDecay = new AlphaDecayAnalyzer();
     return this.getStatus();
   }
 
@@ -733,114 +704,148 @@ export class DryRunSessionService {
   }
 
   submitStrategySignal(symbol: string, signal: StrategySignal, timestampMs?: number): void {
+    if (!signal.signal) return;
+    const side = signal.signal.includes('LONG') ? 'LONG' : signal.signal.includes('SHORT') ? 'SHORT' : null;
+    if (!side) return;
+    const ts = Number.isFinite(timestampMs as number) ? Number(timestampMs) : this.clock.now();
+    const decision: StrategyDecision = {
+      symbol,
+      timestampMs: ts,
+      regime: 'TR',
+      dfs: signal.score,
+      dfsPercentile: clampNumber(signal.score / 100, 0, 0, 1),
+      volLevel: 0.5,
+      gatePassed: true,
+      reasons: ['ENTRY_TR'],
+      actions: [{
+        type: StrategyActionType.ENTRY,
+        side: side as StrategySide,
+        reason: 'ENTRY_TR',
+        expectedPrice: signal.candidate?.entryPrice ?? signal.market?.price ?? null,
+      }],
+      log: {
+        timestampMs: ts,
+        symbol,
+        regime: 'TR',
+        gate: { passed: true, reason: null, details: {} },
+        dfs: signal.score,
+        dfsPercentile: clampNumber(signal.score / 100, 0, 0, 1),
+        volLevel: 0.5,
+        thresholds: { longEntry: 0.85, longBreak: 0.55, shortEntry: 0.15, shortBreak: 0.45 },
+        reasons: ['ENTRY_TR'],
+        actions: [{
+          type: StrategyActionType.ENTRY,
+          side: side as StrategySide,
+          reason: 'ENTRY_TR',
+          expectedPrice: signal.candidate?.entryPrice ?? signal.market?.price ?? null,
+        }],
+        stats: {},
+      },
+    };
+    this.submitStrategyDecision(symbol, decision, ts);
+  }
+
+  submitStrategyDecision(symbol: string, decision: StrategyDecision, timestampMs?: number): void {
     const normalized = normalizeSymbol(symbol);
     const session = this.sessions.get(normalized);
     if (!this.running || !session || !this.config) return;
 
-    // Only process valid signals with a score
-    if (!signal.signal || !signal.candidate || signal.score < DEFAULT_ENTRY_SIGNAL_MIN) return;
+    const decisionTs = Number.isFinite(timestampMs as number) ? Number(timestampMs) : this.clock.now();
+    this.clock.set(decisionTs);
 
-    // Determine side based on signal type
-    let side: 'BUY' | 'SELL' | null = null;
-    if (signal.signal.includes('LONG')) side = 'BUY';
-    if (signal.signal.includes('SHORT')) side = 'SELL';
+    for (const action of decision.actions) {
+      if (action.type === StrategyActionType.NOOP) continue;
 
-    if (!side) return;
+      const position = session.lastState.position;
+      const actionSide = action.side || null;
+      const desiredOrderSide = actionSide === 'LONG' ? 'BUY' : actionSide === 'SHORT' ? 'SELL' : null;
 
-    const signalTs = Number.isFinite(timestampMs as number) ? Number(timestampMs) : this.clock.now();
-    this.clock.set(signalTs);
-    const orderflow = this.buildOrderflowMetrics(signal.orderflow, session);
-    const market = this.buildMarketMetrics(signal.market, session);
-    this.logTradeEvent({
-      type: 'SIGNAL',
-      runId: this.getRunId(),
-      symbol: normalized,
-      timestampMs: signalTs,
-      side: side === 'BUY' ? 'LONG' : 'SHORT',
-      signalType: signal.signal,
-      score: signal.score,
-      vetoReason: signal.vetoReason,
-      candidate: signal.candidate,
-      orderflow,
-      boost: signal.boost,
-      market,
-    });
-
-    const signalSide: 'LONG' | 'SHORT' = side === 'BUY' ? 'LONG' : 'SHORT';
-    session.lastSignal = {
-      side: signalSide,
-      signalType: signal.signal,
-      score: signal.score,
-      candidate: signal.candidate,
-      orderflow,
-      boost: signal.boost,
-      market,
-      timestampMs: signalTs,
-    };
-
-    const position = session.lastState.position;
-    const hasOpenLimits = session.lastState.openLimitOrders.length > 0;
-    if (!position) {
-      if (hasOpenLimits) return;
-      const referencePrice = signal.candidate.entryPrice;
-      if (referencePrice <= 0) return;
-
-      const sizing = this.sizingService.compute({
-        walletBalanceUsdt: session.lastState.walletBalance,
-        baseMarginUsdt: this.config.initialMarginUsdt,
-        markPrice: referencePrice,
-        winStreak: session.winStreak,
-        lossStreak: session.lossStreak,
-        marginHealth: session.lastState.marginHealth,
-      });
-
-      if (!(sizing.quantity > 0)) return;
-      const qty = roundTo(sizing.quantity, 6);
-      session.dynamicLeverage = sizing.leverage;
-      session.engine.setLeverageOverride(sizing.leverage);
-
-      const entryOrders = this.limitStrategy.buildEntryOrders({
-        side,
-        qty,
-        markPrice: referencePrice,
-        orderBook: session.lastOrderBook,
-        urgency: Math.min(1, signal.score / 100),
-      });
-
-      for (const order of entryOrders) {
-        session.manualOrders.push({
-          ...order,
-          reasonCode: 'ENTRY_MARKET',
+      if (action.type === StrategyActionType.ENTRY && desiredOrderSide) {
+        if (position || session.lastState.openLimitOrders.length > 0) continue;
+        const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || 0;
+        if (!(referencePrice > 0)) continue;
+        const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 1);
+        if (!(sizing.qty > 0)) continue;
+        session.engine.setLeverageOverride(sizing.leverage);
+        const entryOrders = this.limitStrategy.buildEntryOrders({
+          side: desiredOrderSide,
+          qty: sizing.qty,
+          markPrice: referencePrice,
+          orderBook: session.lastOrderBook,
+          urgency: clampNumber(decision.dfsPercentile || 0, 0, 0, 1),
         });
+        const reasonCode: DryRunReasonCode = action.reason === 'HARD_REVERSAL_ENTRY' ? 'HARD_REVERSAL_ENTRY' : 'ENTRY_MARKET';
+        for (const order of entryOrders) {
+          session.manualOrders.push({ ...order, reasonCode });
+        }
+        session.lastEntryEventTs = decisionTs;
+        this.addConsoleLog('INFO', normalized, `Decision ENTRY ${actionSide} ${sizing.qty} @ ~${referencePrice}`, session.lastEventTimestampMs);
+        continue;
       }
 
-      session.activeSignal = { type: signal.signal, timestampMs: signalTs };
-      this.alphaDecay.recordSignal(normalized, signal.signal, signalTs);
+      if (action.type === StrategyActionType.ADD && position && desiredOrderSide) {
+        if (position.side !== actionSide) continue;
+        const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || position.entryPrice;
+        const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5);
+        if (!(sizing.qty > 0)) continue;
+        session.engine.setLeverageOverride(sizing.leverage);
+        session.manualOrders.push({
+          side: desiredOrderSide,
+          type: 'MARKET',
+          qty: sizing.qty,
+          timeInForce: 'IOC',
+          reduceOnly: false,
+          reasonCode: 'ADD_MARKET',
+        });
+        this.addConsoleLog('INFO', normalized, `Decision ADD ${actionSide} ${sizing.qty}`, session.lastEventTimestampMs);
+        continue;
+      }
 
-      session.pendingEntry = {
-        reason: 'STRATEGY_SIGNAL',
-        signalType: signal.signal as string,
-        signalScore: signal.score,
-        candidate: signal.candidate,
-        orderflow,
-        boost: signal.boost,
-        market,
-        timestampMs: signalTs,
-        leverage: sizing.leverage,
-      };
+      if (action.type === StrategyActionType.REDUCE && position) {
+        const reducePct = clampNumber(Number(action.reducePct ?? 0.5), 0.5, 0.1, 1);
+        const reduceQty = roundTo(position.qty * reducePct, 6);
+        if (!(reduceQty > 0)) continue;
+        session.manualOrders.push({
+          side: position.side === 'LONG' ? 'SELL' : 'BUY',
+          type: 'MARKET',
+          qty: reduceQty,
+          timeInForce: 'IOC',
+          reduceOnly: true,
+          reasonCode: action.reason === 'REDUCE_EXHAUSTION' ? 'REDUCE_EXHAUSTION' : 'REDUCE_SOFT',
+        });
+        continue;
+      }
 
-      session.lastEntryEventTs = signalTs;
-      this.addConsoleLog('INFO', normalized, `Strategy Signal Executed: ${signal.signal} (${side} ${qty} @ ~${referencePrice})`, session.lastEventTimestampMs);
-      return;
+      if (action.type === StrategyActionType.EXIT && position) {
+        const exitQty = roundTo(position.qty, 6);
+        if (!(exitQty > 0)) continue;
+        session.manualOrders.push({
+          side: position.side === 'LONG' ? 'SELL' : 'BUY',
+          type: 'MARKET',
+          qty: exitQty,
+          timeInForce: 'IOC',
+          reduceOnly: true,
+          reasonCode: action.reason === 'EXIT_HARD_REVERSAL' ? 'HARD_REVERSAL_EXIT' : 'EXIT_MARKET',
+        });
+        session.pendingExitReason = action.reason;
+      }
     }
+  }
 
-    if (position.side === signalSide) {
-      this.tryQueueAddOn(session, signal, signalTs, side, orderflow, market);
-      return;
-    }
-
-    this.tryFlipInvalidation(session, signal, signalTs, side, orderflow, market);
-    return;
+  getStrategyPosition(symbol: string): StrategyPositionState | null {
+    const normalized = normalizeSymbol(symbol);
+    const session = this.sessions.get(normalized);
+    if (!session || !session.lastState.position) return null;
+    const pos = session.lastState.position;
+    const markPrice = session.latestMarkPrice || pos.entryPrice;
+    return {
+      side: pos.side,
+      qty: pos.qty,
+      entryPrice: pos.entryPrice,
+      unrealizedPnlPct: this.computeUnrealizedPnlPct(session, markPrice),
+      addsUsed: session.addOnState?.count ?? 0,
+      peakPnlPct: undefined,
+    };
   }
 
   ingestDepthEvent(input: {
@@ -943,7 +948,6 @@ export class DryRunSessionService {
     }
 
     if (prevPosition && !out.state.position && session.activeSignal) {
-      this.alphaDecay.recordExit(symbol, eventTimestampMs);
       session.activeSignal = null;
     }
 
@@ -1101,7 +1105,7 @@ export class DryRunSessionService {
       },
       perSymbol,
       logTail: [...this.logTail],
-      alphaDecay: this.alphaDecay.getSummary(),
+      alphaDecay: [],
     };
   }
 
@@ -1147,16 +1151,8 @@ export class DryRunSessionService {
           const pending = session.pendingFlipEntry;
           const referencePrice = pending.candidate?.entryPrice ?? markPrice;
           if (referencePrice > 0) {
-            const sizing = this.sizingService.compute({
-              walletBalanceUsdt: session.lastState.walletBalance,
-              baseMarginUsdt: this.config.initialMarginUsdt,
-              markPrice: referencePrice,
-              winStreak: session.winStreak,
-              lossStreak: session.lossStreak,
-              marginHealth: session.lastState.marginHealth,
-            });
-            const qty = roundTo(Math.max(0, sizing.quantity), 6);
-            session.dynamicLeverage = sizing.leverage;
+            const sizing = this.computeRiskSizing(session, referencePrice, 'TR');
+            const qty = roundTo(Math.max(0, sizing.qty), 6);
             session.engine.setLeverageOverride(sizing.leverage);
             if (qty > 0) {
               const entryOrders = this.limitStrategy.buildEntryOrders({
@@ -1190,16 +1186,8 @@ export class DryRunSessionService {
         // Only trigger internal random entry if debugAggressiveEntry is TRUE
         if (this.config.debugAggressiveEntry) {
           const side: 'BUY' | 'SELL' = this.resolveEntrySide(session, markPrice);
-          const sizing = this.sizingService.compute({
-            walletBalanceUsdt: session.lastState.walletBalance,
-            baseMarginUsdt: this.config.initialMarginUsdt,
-            markPrice,
-            winStreak: session.winStreak,
-            lossStreak: session.lossStreak,
-            marginHealth: session.lastState.marginHealth,
-          });
-          const qty = roundTo(Math.max(0, sizing.quantity), 6);
-          session.dynamicLeverage = sizing.leverage;
+          const sizing = this.computeRiskSizing(session, markPrice, 'TR');
+          const qty = roundTo(Math.max(0, sizing.qty), 6);
           session.engine.setLeverageOverride(sizing.leverage);
           if (qty > 0) {
             const entryOrders = this.limitStrategy.buildEntryOrders({
@@ -1727,6 +1715,21 @@ export class DryRunSessionService {
     if (!(bestBid > 0) || !(bestAsk > 0)) return null;
     const mid = (bestBid + bestAsk) / 2;
     return mid > 0 ? (bestAsk - bestBid) / mid : null;
+  }
+
+  private computeRiskSizing(session: SymbolSession, price: number, regime: StrategyRegime, sizeMultiplier = 1): { qty: number; leverage: number } {
+    if (!this.config || !(price > 0)) return { qty: 0, leverage: session.dynamicLeverage || 1 };
+    const res = this.riskGovernor.compute({
+      equity: session.lastState.walletBalance,
+      price,
+      vwap: session.latestMarkPrice || price,
+      volatility: session.atr || 0,
+      regime,
+      liquidationDistance: null,
+    });
+    const qty = roundTo(Math.max(0, res.qty * sizeMultiplier), 6);
+    const leverage = session.dynamicLeverage || this.config.leverage || 1;
+    return { qty, leverage };
   }
 
   private getHoldRemainingMs(session: SymbolSession, nowMs: number): number {

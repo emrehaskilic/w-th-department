@@ -49,7 +49,8 @@ import { OICalculator } from './metrics/OICalculator';
 import { SymbolEventQueue } from './utils/SymbolEventQueue';
 import { SnapshotTracker } from './telemetry/Snapshot';
 import { apiKeyMiddleware, validateWebSocketApiKey } from './auth/apiKey';
-import { StrategyEngine } from './strategy/StrategyEngine';
+import { NewStrategyV11 } from './strategy/NewStrategyV11';
+import { DecisionLog } from './telemetry/DecisionLog';
 import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService, isUpstreamGuardError } from './dryrun';
 import { logger, requestLogger, serializeError } from './utils/logger';
 import { WebSocketManager } from './ws/WebSocketManager';
@@ -123,7 +124,7 @@ function parseEnvFlag(value: string | undefined): boolean {
 }
 
 const EXECUTION_ENABLED_ENV = parseEnvFlag(process.env.EXECUTION_ENABLED);
-let EXECUTION_ENABLED = EXECUTION_ENABLED_ENV;
+let EXECUTION_ENABLED = false;
 const EXECUTION_ENV = 'testnet';
 
 // =============================================================================
@@ -230,7 +231,9 @@ const fundingMonitors = new Map<string, FundingMonitor>();
 // [PHASE 1 & 2] New Maps
 const backfillMap = new Map<string, KlineBackfill>();
 const oiCalculatorMap = new Map<string, OICalculator>();
-const strategyMap = new Map<string, StrategyEngine>();
+const decisionLog = new DecisionLog();
+decisionLog.start();
+const strategyMap = new Map<string, NewStrategyV11>();
 const backfillInFlight = new Set<string>();
 const backfillLastAttemptMs = new Map<string, number>();
 const BACKFILL_RETRY_INTERVAL_MS = 30_000;
@@ -393,7 +396,7 @@ const getIntegrity = (s: string) => {
 // [PHASE 1 & 2] New Getters
 const getBackfill = (s: string) => { if (!backfillMap.has(s)) backfillMap.set(s, new KlineBackfill(s, BINANCE_REST_BASE)); return backfillMap.get(s)!; };
 const getOICalc = (s: string) => { if (!oiCalculatorMap.has(s)) oiCalculatorMap.set(s, new OICalculator(s, BINANCE_REST_BASE)); return oiCalculatorMap.get(s)!; };
-const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s, new StrategyEngine()); return strategyMap.get(s)!; };
+const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s, new NewStrategyV11({}, decisionLog)); return strategyMap.get(s)!; };
 
 function ensureMonitors(symbol: string) {
     const backfill = getBackfill(symbol);
@@ -975,67 +978,83 @@ async function processSymbolEvent(s: string, d: any) {
         const absVal = abs.addTrade(s, p, side, t, levelSize);
         absorptionResult.set(s, absVal);
 
-        // [PHASE 2] Strategy Check
+        // [NEW_STRATEGY_V1.1] Decision Check
         const strategy = getStrategy(s);
         const backfill = getBackfill(s);
         const calcStart = Date.now();
         const legMetrics = leg.computeMetrics(ob);
-        const signal = strategy.compute({
-            price: p,
-            atr: backfill.getState().atr,
-            avgAtr: backfill.getState().avgAtr,
-            recentHigh: backfill.getState().recentHigh,
-            recentLow: backfill.getState().recentLow,
-            obi: legMetrics?.obiDeep || 0,
-            deltaZ: legMetrics?.deltaZ || 0,
-            cvdSlope: legMetrics?.cvdSlope || 0,
-            ready: backfill.getState().ready,
-            vetoReason: backfill.getState().vetoReason
+        const oiMetrics = leg.getOpenInterestMetrics();
+        const integrity = getIntegrity(s).getStatus(now);
+        const bestBidPx = bestBid(ob);
+        const bestAskPx = bestAsk(ob);
+        const mid = (bestBidPx && bestAskPx) ? (bestBidPx + bestAskPx) / 2 : p;
+        const spreadPct = (bestBidPx && bestAskPx && mid)
+            ? ((bestAskPx - bestBidPx) / mid) * 100
+            : null;
+
+        const tasMetrics = tas.computeMetrics();
+        const decision = strategy.evaluate({
+            symbol: s,
+            nowMs: Number(t || now),
+            source: oiMetrics?.source ?? 'real',
+            orderbook: {
+                lastUpdatedMs: integrity.lastUpdateTimestamp || now,
+                spreadPct,
+                bestBid: bestBidPx,
+                bestAsk: bestAskPx,
+            },
+            trades: {
+                lastUpdatedMs: Number(t || now),
+                printsPerSecond: tasMetrics.printsPerSecond,
+                tradeCount: tasMetrics.tradeCount,
+                aggressiveBuyVolume: tasMetrics.aggressiveBuyVolume,
+                aggressiveSellVolume: tasMetrics.aggressiveSellVolume,
+                consecutiveBurst: tasMetrics.consecutiveBurst,
+            },
+            market: {
+                price: p,
+                vwap: legMetrics?.vwap || mid || p,
+                delta1s: legMetrics?.delta1s || 0,
+                delta5s: legMetrics?.delta5s || 0,
+                deltaZ: legMetrics?.deltaZ || 0,
+                cvdSlope: legMetrics?.cvdSlope || 0,
+                obiWeighted: legMetrics?.obiWeighted || 0,
+                obiDeep: legMetrics?.obiDeep || 0,
+                obiDivergence: legMetrics?.obiDivergence || 0,
+            },
+            openInterest: oiMetrics ? {
+                oiChangePct: oiMetrics.oiChangePct,
+                lastUpdatedMs: oiMetrics.lastUpdated,
+                source: oiMetrics.source,
+            } : null,
+            absorption: {
+                value: absVal,
+                side: absVal ? side : null,
+            },
+            volatility: backfill.getState().atr || 0,
+            position: dryRunSession.getStrategyPosition(s),
         });
-        signal.orderflow = {
-            obiWeighted: legMetrics?.obiWeighted ?? null,
-            obiDeep: legMetrics?.obiDeep ?? null,
-            deltaZ: legMetrics?.deltaZ ?? null,
-            cvdSlope: legMetrics?.cvdSlope ?? null,
-        };
-        signal.market = {
-            price: p,
-            atr: backfill.getState().atr,
-            avgAtr: backfill.getState().avgAtr,
-            recentHigh: backfill.getState().recentHigh,
-            recentLow: backfill.getState().recentLow,
-        };
+
         latencyTracker.record('strategy_calc_ms', Date.now() - calcStart);
 
-        // [PHASE 3] Execution Check
-        // Execution now flows through the orchestrator (gate + decision + executor).
-
         // [DRY RUN INTEGRATION]
-        // If a valid signal is generated, feed it into the Dry Run engine
         const isDryRunTracked = dryRunSession.isTrackingSymbol(s);
         if (isDryRunTracked) {
-            // Debug log to trace why signals might be missing
-            if (Math.random() < 0.05) { // Sample 5% of ticks to avoid spam
+            if (Math.random() < 0.05) {
                 log('DRY_RUN_STRATEGY_CHECK', {
                     symbol: s,
-                    signal: signal?.signal,
-                    score: signal?.score,
-                    ready: backfill.getState().ready,
-                    veto: signal?.vetoReason
+                    regime: decision.regime,
+                    dfsP: decision.dfsPercentile,
+                    gate: decision.gatePassed
                 });
             }
+            dryRunSession.submitStrategyDecision(s, decision, Number(t || now));
         }
 
-        if (signal.signal && isDryRunTracked) {
-            log('DRY_RUN_SIGNAL_SUBMIT', { symbol: s, signal: signal.signal });
-            dryRunSession.submitStrategySignal(s, signal, Number(t || now));
-        }
-        if (signal.signal) {
-            abTestManager.submitStrategySignal(s, signal, Number(t || now));
-        }
+        abTestManager.submitStrategyDecision(s, decision, Number(t || now));
 
         // Broadcast
-        broadcastMetrics(s, ob, tas, cvd, absVal, leg, t, signal);
+        broadcastMetrics(s, ob, tas, cvd, absVal, leg, t, decision);
     }
 }
 
@@ -1066,7 +1085,7 @@ function broadcastMetrics(
     absVal: number,
     leg: LegacyCalculator,
     eventTimeMs: number,
-    signal: any = null,
+    decision: any = null,
     reason: 'depth' | 'trade' = 'trade'
 ) {
     const THROTTLE_MS = 250; // 4Hz max per symbol
@@ -1136,10 +1155,18 @@ function broadcastMetrics(
         funding: lastFunding.get(s) || null,
         legacyMetrics: legacyM,
         orderbookIntegrity: integrity,
-        signalDisplay: signal || { signal: null, score: 0, vetoReason: bf.vetoReason || 'NO_SIGNAL', candidate: null },
+        signalDisplay: decision
+            ? {
+                regime: decision.regime,
+                dfsPercentile: decision.dfsPercentile,
+                actions: decision.actions,
+                reasons: decision.reasons,
+                gatePassed: decision.gatePassed,
+            }
+            : { signal: null, score: 0, vetoReason: bf.vetoReason || 'NO_SIGNAL', candidate: null },
         advancedMetrics: {
-            sweepFadeScore: signal?.score || 0,
-            breakoutScore: signal?.score || 0,
+            sweepFadeScore: decision?.dfsPercentile || 0,
+            breakoutScore: decision?.dfsPercentile || 0,
             volatilityIndex: bf.atr
         },
         bids, asks,
@@ -1679,7 +1706,7 @@ app.post('/api/dry-run/run', (req, res) => {
 });
 
 app.get('/api/alpha-decay', (_req, res) => {
-    res.json({ ok: true, alphaDecay: dryRunSession.getStatus().alphaDecay });
+    res.json({ ok: true, alphaDecay: [] });
 });
 
 app.get('/api/portfolio/status', (_req, res) => {

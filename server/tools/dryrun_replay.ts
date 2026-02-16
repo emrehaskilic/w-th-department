@@ -1,5 +1,5 @@
 import { DryRunSessionService } from '../dryrun';
-import { StrategySignal } from '../strategy/StrategyEngine';
+import { StrategySignal } from '../types/strategy';
 
 const symbol = 'BTCUSDT';
 const service = new DryRunSessionService();

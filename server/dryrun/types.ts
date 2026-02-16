@@ -3,6 +3,12 @@ export type DryRunOrderType = 'MARKET' | 'LIMIT';
 export type DryRunTimeInForce = 'IOC' | 'GTC';
 export type DryRunReasonCode =
   | 'ENTRY_MARKET'
+  | 'ADD_MARKET'
+  | 'EXIT_MARKET'
+  | 'REDUCE_SOFT'
+  | 'REDUCE_EXHAUSTION'
+  | 'HARD_REVERSAL_EXIT'
+  | 'HARD_REVERSAL_ENTRY'
   | 'ADDON_MAKER'
   | 'REDUCE_PARTIAL'
   | 'PROFITLOCK'

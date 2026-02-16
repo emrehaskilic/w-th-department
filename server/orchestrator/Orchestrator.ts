@@ -1,11 +1,10 @@
 import * as path from 'path';
 import { ExecutionConnector } from '../connectors/ExecutionConnector';
 import { ExecutionEvent, Side } from '../connectors/executionTypes';
-import { BinanceExecutor } from '../execution/BinanceExecutor';
+import { DryRunExecutor } from '../execution/DryRunExecutor';
 import { IExecutor } from '../execution/types';
 import { TradeLogger } from '../logger/TradeLogger';
 import { FundingRateMonitor } from '../metrics/FundingRateMonitor';
-import { RiskManager } from '../risk/RiskManager';
 import { AlertService } from '../notifications/AlertService';
 import { logger } from '../utils/logger';
 import { SymbolActor } from './Actor';
@@ -16,7 +15,6 @@ import { PlannedOrder } from './OrderPlan';
 import { OrderMonitor } from './OrderMonitor';
 import { PlanRunner, PlanTickResult } from './PlanRunner';
 import { reconcilePosition } from './Reconciler';
-import { SizingRamp } from './SizingRamp';
 import {
   DecisionAction,
   GateConfig,
@@ -44,8 +42,6 @@ export class Orchestrator {
   private readonly realizedPnlBySymbol = new Map<string, number>();
   private readonly executionSymbols = new Set<string>();
   private readonly actors = new Map<string, SymbolActor>();
-  private readonly ramps = new Map<string, SizingRamp>();
-  private readonly riskManagers = new Map<string, RiskManager>();
   private readonly planRunners = new Map<string, PlanRunner>();
   private readonly expectedOrderMeta = new Map<string, ExpectedOrderMeta>();
   private readonly decisionLedger: any[] = [];
@@ -84,7 +80,16 @@ export class Orchestrator {
     this.capitalSettings.leverage = Math.min(this.connector.getPreferredLeverage(), config.maxLeverage);
     this.connector.setPreferredLeverage(this.capitalSettings.leverage);
 
-    this.executor = new BinanceExecutor(this.connector);
+    this.executor = new DryRunExecutor(async (decision) => {
+      return {
+        ok: true,
+        orderId: `dryrun-${Date.now()}`,
+        executedQuantity: decision.quantity,
+        executedPrice: decision.price,
+        fee: '0',
+        feeTier: 'MAKER',
+      };
+    });
 
     this.logger = new OrchestratorLogger({
       dir: path.join(process.cwd(), 'logs', 'orchestrator'),
@@ -124,6 +129,10 @@ export class Orchestrator {
 
   getConnector() {
     return this.connector;
+  }
+
+  private isDryRunOnly(): boolean {
+    return true;
   }
 
   async start() {
@@ -197,8 +206,6 @@ export class Orchestrator {
     this.stateSnapshots.clear();
     this.expectedOrderMeta.clear();
     this.actors.clear();
-    this.ramps.clear();
-    this.riskManagers.clear();
     this.planRunners.clear();
   }
 
@@ -271,10 +278,6 @@ export class Orchestrator {
         }
       }
       this.capitalSettings.pairInitialMargins = normalized;
-      for (const [symbol, margin] of Object.entries(normalized)) {
-        this.ensureRamp(symbol).updateConfig({ startingMarginUsdt: margin });
-        this.ensureRamp(symbol).forceBudget(margin);
-      }
     }
 
     this.capitalSettings.totalMarginBudgetUsdt = Math.max(0, this.connector.getWalletBalance() || 0);
@@ -324,7 +327,6 @@ export class Orchestrator {
     for (const symbol of normalized) {
       this.executionSymbols.add(symbol);
       this.ensureActor(symbol);
-      this.ensureRamp(symbol);
     }
     this.connector.setSymbols(normalized);
     await this.connector.syncState();
@@ -332,11 +334,9 @@ export class Orchestrator {
       await this.connector.ensureSymbolsReady();
     }
 
-    for (const symbol of Array.from(this.ramps.keys())) {
+    for (const symbol of Array.from(this.actors.keys())) {
       if (!this.executionSymbols.has(symbol)) {
-        this.ramps.delete(symbol);
         this.actors.delete(symbol);
-        this.riskManagers.delete(symbol);
         this.planRunners.delete(symbol);
       }
     }
@@ -465,7 +465,7 @@ export class Orchestrator {
       getExpectedOrderMeta: (orderId) => this.expectedOrderMeta.get(orderId) || null,
       getStartingMarginUsdt: () => this.getStartingMarginUsdt(normalized),
       getCurrentMarginBudgetUsdt: () => this.getCurrentMarginBudgetUsdt(normalized),
-      getRampMult: () => this.getRampMult(normalized),
+      getRampMult: () => 1,
       getEffectiveLeverage: () => this.getEffectiveLeverage(),
       getExecutionReady: () => this.getExecutionGateState().ready,
       getBackoffActive: () => this.connector.isRateLimitBackoffActive(),
@@ -491,50 +491,6 @@ export class Orchestrator {
     return runner;
   }
 
-  private ensureRamp(symbol: string): SizingRamp {
-    const normalized = symbol.toUpperCase();
-    const existing = this.ramps.get(normalized);
-    if (existing) {
-      return existing;
-    }
-
-    const startingMargin = this.getStartingMarginUsdt(normalized);
-    const ramp = new SizingRamp({
-      startingMarginUsdt: startingMargin,
-      minMarginUsdt: this.config.minMarginUsdt,
-      rampStepPct: this.config.rampStepPct,
-      rampDecayPct: this.config.rampDecayPct,
-      rampMaxMult: this.config.rampMaxMult,
-    });
-
-    this.ramps.set(normalized, ramp);
-    return ramp;
-  }
-
-  private getRiskManager(symbol: string): RiskManager {
-    const normalized = symbol.toUpperCase();
-    const existing = this.riskManagers.get(normalized);
-    if (existing) {
-      return existing;
-    }
-    const manager = new RiskManager({
-      maxPositionNotionalUsdt: 500,
-      cooldownMs: 10_000,
-      maxSlippagePct: 0.1,
-      circuitBreaker: {
-        maxConsecutiveLosses: Number(process.env.CB_MAX_CONSEC_LOSSES || 3),
-        maxDailyDrawdownPct: Number(process.env.CB_MAX_DAILY_DRAWDOWN_PCT || 0.15),
-        pauseDurationMs: Number(process.env.CB_PAUSE_MS || 30 * 60 * 1000),
-      },
-      onAlert: (message) => {
-        this.log('CIRCUIT_BREAKER_ALERT', { symbol: normalized, message });
-        this.alertService?.send('LARGE_LOSS', `${normalized}: ${message}`, 'HIGH');
-      },
-    });
-    this.riskManagers.set(normalized, manager);
-    return manager;
-  }
-
   private getStartingMarginUsdt(symbol: string): number {
     const override = Number(this.capitalSettings.pairInitialMargins[symbol]);
     if (Number.isFinite(override) && override > 0) {
@@ -548,8 +504,7 @@ export class Orchestrator {
     if (Number.isFinite(override) && override > 0) {
       return override;
     }
-    const ramp = this.ensureRamp(symbol);
-    const budget = ramp.getCurrentMarginBudgetUsdt();
+    const budget = this.getStartingMarginUsdt(symbol);
     const wallet = this.connector.getWalletBalance() || 0;
     const symbolCount = Math.max(1, this.executionSymbols.size || 1);
     const walletCap = wallet > 0 ? wallet / symbolCount : 0;
@@ -557,10 +512,6 @@ export class Orchestrator {
       return Math.min(budget, walletCap);
     }
     return budget;
-  }
-
-  private getRampMult(symbol: string): number {
-    return this.ensureRamp(symbol).getState().rampMult;
   }
 
   private getEffectiveLeverage(): number {
@@ -584,9 +535,6 @@ export class Orchestrator {
       cvdSlope?: number | null;
     };
   }) {
-    const ramp = this.ensureRamp(symbol);
-    ramp.onTradeClosed(close.realizedPnl);
-    this.getRiskManager(symbol).recordTradeClosed(close.realizedPnl, this.connector.getWalletBalance() || 0);
     const daily = this.updateDailyLoss(close.realizedPnl);
     if (daily.triggered) {
       void this.triggerDailyKillSwitch('daily_drawdown', daily.drawdownPct);
@@ -764,6 +712,11 @@ export class Orchestrator {
       bufferBps,
     };
 
+    if (this.isDryRunOnly()) {
+      this.log('DRY_RUN_PLANNED_ORDER', { ...auditBase, role: order.role });
+      return;
+    }
+
     if (this.killSwitch) {
       this.logOrderAttemptAudit({ ...auditBase, reasonCode: 'KILL_SWITCH' });
       return;
@@ -826,23 +779,6 @@ export class Orchestrator {
       return;
     }
 
-    if (!order.reduceOnly) {
-      const risk = this.getRiskManager(order.symbol);
-      const riskCheck = risk.check(order.symbol, side, sizingPrice, sizingQty, {
-        maxPositionNotionalUsdt: marginBudget > 0 ? marginBudget * leverage * 1.02 : undefined,
-      });
-      if (!riskCheck.ok) {
-        this.logOrderAttemptAudit({
-          ...auditBase,
-          qty: sizingQty,
-          notional: sizingNotional,
-          reasonCode: 'RISK_BLOCK',
-          error: riskCheck.reason || 'risk_blocked',
-        });
-        return;
-      }
-    }
-
     try {
       const res = await this.connector.placeOrder({
         symbol: order.symbol,
@@ -886,9 +822,6 @@ export class Orchestrator {
           });
         }
       }
-      if (!order.reduceOnly) {
-        this.getRiskManager(order.symbol).recordTrade(order.symbol);
-      }
       if (order.role === 'TP') {
         this.log('TP_PLACED', { symbol: order.symbol, price: sizingPrice, qty: sizingQty, clientOrderId: order.clientOrderId });
       }
@@ -910,6 +843,10 @@ export class Orchestrator {
     fallbackFromOrderId: string;
   }) {
     if (!(input.qty > 0)) {
+      return;
+    }
+    if (this.isDryRunOnly()) {
+      this.log('DRY_RUN_MARKET_FALLBACK', { symbol: input.symbol, side: input.side, qty: input.qty });
       return;
     }
     try {
@@ -1051,7 +988,6 @@ export class Orchestrator {
         continue;
       }
 
-      const risk = this.getRiskManager(symbol);
       const riskCheck = risk.check(symbol, side, price, sizingQty, {
         maxPositionNotionalUsdt: marginBudget > 0 ? marginBudget * leverage * 1.02 : undefined,
       });
@@ -1089,9 +1025,6 @@ export class Orchestrator {
             sentAtMs: Date.now(),
             tag,
           });
-        }
-        if (res.ok) {
-          risk.recordTrade(symbol);
         }
       } catch (e: any) {
         const msg = e?.message || 'execution_failed';
@@ -1160,6 +1093,11 @@ export class Orchestrator {
     this.log('DAILY_KILL_SWITCH_TRIGGERED', { reason, drawdownPct });
     this.alertService?.send('DAILY_KILL_SWITCH', `Kill switch engaged: ${reason}`, 'CRITICAL');
 
+    if (this.isDryRunOnly()) {
+      this.log('DRY_RUN_KILL_SWITCH', { reason, drawdownPct });
+      return;
+    }
+
     for (const [symbol, actor] of this.actors.entries()) {
       const position = actor.state.position;
       try {
@@ -1197,6 +1135,10 @@ export class Orchestrator {
     previousOrderId: string;
     clientOrderId: string;
   }): Promise<{ orderId: string; clientOrderId: string; price: number } | null> {
+    if (this.isDryRunOnly()) {
+      this.log('DRY_RUN_LIMIT_REPRICE', { symbol: input.symbol, side: input.side, qty: input.qty });
+      return { orderId: `dryrun-${Date.now()}`, clientOrderId: input.clientOrderId, price: 0 };
+    }
     const price = this.getMakerLimitPrice(input.symbol, input.side);
     if (price == null || !(price > 0)) {
       this.log('LIMIT_REPRICE_PRICE_MISSING', { symbol: input.symbol, previousOrderId: input.previousOrderId });

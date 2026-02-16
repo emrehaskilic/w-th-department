@@ -1,5 +1,5 @@
 import { DryRunSessionService } from '../dryrun/DryRunSessionService';
-import { StrategySignal } from '../strategy/StrategyEngine';
+import { StrategyDecision } from '../types/strategy';
 import { AlertService } from '../notifications/AlertService';
 import { ABTestComparison, ABTestSessionSnapshot, ABTestStartInput, ABTestStrategyProfile } from './types';
 
@@ -14,12 +14,16 @@ interface ActiveSession {
   engineB: DryRunSessionService;
 }
 
-function applySignalProfile(signal: StrategySignal, profile: ABTestStrategyProfile): StrategySignal | null {
+function applyDecisionProfile(decision: StrategyDecision, profile: ABTestStrategyProfile): StrategyDecision | null {
   const multiplier = Number.isFinite(profile.signalScoreMultiplier) ? Number(profile.signalScoreMultiplier) : 1;
   const minScore = Number.isFinite(profile.signalMinScore) ? Number(profile.signalMinScore) : 0;
-  const adjustedScore = signal.score * multiplier;
+  const score = (decision.dfsPercentile || 0) * 100;
+  const adjustedScore = score * multiplier;
   if (adjustedScore < minScore) return null;
-  return { ...signal, score: adjustedScore };
+  return {
+    ...decision,
+    dfsPercentile: Math.max(0, Math.min(1, adjustedScore / 100)),
+  };
 }
 
 export class ABTestManager {
@@ -87,12 +91,12 @@ export class ABTestManager {
     this.session.engineB.ingestDepthEvent(event);
   }
 
-  submitStrategySignal(symbol: string, signal: StrategySignal, timestampMs?: number): void {
+  submitStrategyDecision(symbol: string, decision: StrategyDecision, timestampMs?: number): void {
     if (!this.session || this.session.status !== 'RUNNING') return;
-    const signalA = applySignalProfile(signal, this.session.sessionA);
-    const signalB = applySignalProfile(signal, this.session.sessionB);
-    if (signalA) this.session.engineA.submitStrategySignal(symbol, signalA, timestampMs);
-    if (signalB) this.session.engineB.submitStrategySignal(symbol, signalB, timestampMs);
+    const decisionA = applyDecisionProfile(decision, this.session.sessionA);
+    const decisionB = applyDecisionProfile(decision, this.session.sessionB);
+    if (decisionA) this.session.engineA.submitStrategyDecision(symbol, decisionA, timestampMs);
+    if (decisionB) this.session.engineB.submitStrategyDecision(symbol, decisionB, timestampMs);
   }
 
   getSnapshot(): ABTestSessionSnapshot {

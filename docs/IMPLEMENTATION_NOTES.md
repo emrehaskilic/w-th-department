@@ -18,14 +18,14 @@
    - `server/metrics/OICalculator.ts`: REST polling + `openInterestHist` support.
    - `server/utils/SymbolEventQueue.ts`: Deterministic event ordering.
    - `server/telemetry/Snapshot.ts`: Snapshot hashing and sequence tracking.
-3. **[PHASE 2] Strategy Signals:**
-   - `server/strategy/StrategyEngine.ts`: Sweep-Fade and Imbalance-Breakout logic.
-   - Updated `MetricsMessage` to include `signalDisplay` and `advancedMetrics`.
-4. **[PHASE 3] Optional Execution:**
-   - `EXECUTION_ENABLED` flag logic.
-   - `server/risk/RiskManager.ts`: Notional caps and cooldowns.
-   - `server/execution/BinanceExecutor.ts`: Execution logic for LIMIT orders.
-   - `POST /api/kill-switch` implementation.
+3. **[PHASE 2] Strategy Signals (V1.1):**
+   - `server/strategy/NewStrategyV11.ts`: Regime + DFS + anti-flip state machine.
+   - `server/strategy/Normalization.ts`: Sliding Welford + percentile normalization.
+   - `server/strategy/RegimeSelector.ts`: EV/TR/MR lock logic.
+4. **[PHASE 3] Dry-Run Only:**
+   - `DRY_RUN=true` default and dry-run execution guards.
+   - `server/risk/RiskGovernorV11.ts`: Risk sizing (R-based) and clamps.
+   - `server/telemetry/DecisionLog.ts`: Structured decision logs.
 
 ## Security & Integrity
 - **Kill-Switch:** Default state is SAFE (execution disabled).
@@ -33,10 +33,10 @@
 - **Determinism:** Each metrics snapshot contains a `stateHash` to verify output stability.
 
 ## Current Execution/Strategy/Risk/Telemetry Paths (Discovery)
-- **Order send/cancel:** `server/connectors/ExecutionConnector.ts` (`placeOrder`, `cancelOrder`, `syncState`) and `server/execution/BinanceExecutor.ts` (`execute`).
-- **Execution wiring:** `server/orchestrator/Orchestrator.ts` (`handleActions` → `BinanceExecutor.execute`) and `server/index.ts` (`broadcastMetrics` → `orchestrator.ingest`).
-- **Strategy loop:** `server/index.ts` (trade/depth events → `StrategyEngine.compute` → `broadcastMetrics`) and `server/strategy/StrategyEngine.ts`.
-- **Risk/cooldown:** `server/risk/RiskManager.ts` (cooldown/notional), `server/orchestrator/SizingRamp.ts` (budget ramp).
+- **Order send/cancel:** Dry-run guarded in `server/orchestrator/Orchestrator.ts` and `server/execution/DryRunExecutor.ts`.
+- **Execution wiring:** `server/orchestrator/Orchestrator.ts` (decision → dry-run executor) and `server/index.ts` (`broadcastMetrics` → `orchestrator.ingest`).
+- **Strategy loop:** `server/index.ts` (trade/depth events → `NewStrategyV11.evaluate` → `broadcastMetrics`) and `server/strategy/NewStrategyV11.ts`.
+- **Risk/cooldown:** `server/risk/RiskGovernorV11.ts` (R-based sizing, clamps).
 - **Telemetry/logs:** `server/orchestrator/Logger.ts` (metrics/decision/execution JSONL), `server/orchestrator/Actor.ts` (decision/execution logging), `server/orchestrator/Orchestrator.ts` (ORDER_ATTEMPT_AUDIT stdout).
 
 ## Order Plan Architecture (Boot Probe + Ladder)

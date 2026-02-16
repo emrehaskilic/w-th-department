@@ -1,7 +1,8 @@
 import { MarketDataArchive, ArchiveEvent } from './MarketDataArchive';
 import { LegacyCalculator } from '../metrics/LegacyCalculator';
-import { StrategyEngine } from '../strategy/StrategyEngine';
+import { NewStrategyV11 } from '../strategy/NewStrategyV11';
 import { createOrderbookState, applySnapshot } from '../metrics/OrderbookManager';
+import { TimeAndSales } from '../metrics/TimeAndSales';
 
 export interface SignalReplayResult {
   symbol: string;
@@ -38,7 +39,8 @@ export class SignalReplay {
 
     const orderbook = createOrderbookState();
     const legacy = new LegacyCalculator();
-    const strategy = new StrategyEngine();
+    const tas = new TimeAndSales();
+    const strategy = new NewStrategyV11();
     const signals: SignalReplayResult['signals'] = [];
     const priceHistory: number[] = [];
     let atr = 0;
@@ -59,26 +61,50 @@ export class SignalReplay {
         if (price > 0) {
           atr = updateAtr(priceHistory, price);
         }
+        tas.addTrade({ price, quantity: qty, side, timestamp: event.timestampMs });
         legacy.addTrade({ price, quantity: qty, side, timestamp: event.timestampMs });
         const metrics = legacy.computeMetrics(orderbook);
         if (metrics) {
-          const signal = strategy.compute({
-            price,
-            atr,
-            avgAtr: atr,
-            recentHigh: Math.max(...priceHistory, price),
-            recentLow: Math.min(...priceHistory, price),
-            obi: metrics.obiDeep || 0,
-            deltaZ: metrics.deltaZ || 0,
-            cvdSlope: metrics.cvdSlope || 0,
-            ready: atr > 0,
-            vetoReason: atr > 0 ? null : 'NO_ATR',
+          const tasMetrics = tas.computeMetrics();
+          const decision = strategy.evaluate({
+            symbol,
+            nowMs: event.timestampMs,
+            source: 'real',
+            orderbook: {
+              lastUpdatedMs: event.timestampMs,
+              spreadPct: null,
+              bestBid: null,
+              bestAsk: null,
+            },
+            trades: {
+              lastUpdatedMs: event.timestampMs,
+              printsPerSecond: tasMetrics.printsPerSecond,
+              tradeCount: tasMetrics.tradeCount,
+              aggressiveBuyVolume: tasMetrics.aggressiveBuyVolume,
+              aggressiveSellVolume: tasMetrics.aggressiveSellVolume,
+              consecutiveBurst: tasMetrics.consecutiveBurst,
+            },
+            market: {
+              price,
+              vwap: metrics.vwap || price,
+              delta1s: metrics.delta1s || 0,
+              delta5s: metrics.delta5s || 0,
+              deltaZ: metrics.deltaZ || 0,
+              cvdSlope: metrics.cvdSlope || 0,
+              obiWeighted: metrics.obiWeighted || 0,
+              obiDeep: metrics.obiDeep || 0,
+              obiDivergence: metrics.obiDivergence || 0,
+            },
+            openInterest: null,
+            absorption: null,
+            volatility: atr,
+            position: null,
           });
           signals.push({
             timestampMs: event.timestampMs,
-            signal: signal.signal,
-            score: signal.score,
-            confidence: signal.confidence,
+            signal: decision.actions[0]?.reason ?? null,
+            score: Math.round((decision.dfsPercentile || 0) * 100),
+            confidence: decision.gatePassed ? 'PASS' : 'BLOCKED',
           });
         }
       }
